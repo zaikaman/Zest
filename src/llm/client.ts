@@ -613,14 +613,14 @@ export class LLMClient {
     let usage: LLMResponse["usage"] = resumeState?.usage;
     let finalText = resumeState?.finalText || "";
 
-    const maxSteps = hasTools ? 10 : 1;
+    const maxSteps = hasTools ? Infinity : 1;
     let stepsCompleted = resumeState?.stepsCompleted || 0;
     let previousToolCycleSignature = "";
     let repeatedToolCycleCount = 0;
 
     if (resumeState) {
       logger.debug(
-        `Resuming generation from step ${stepsCompleted + 1}/${maxSteps} with ${allToolCalls.length} prior tool calls and ${contents.length} prior message blocks`
+        `Resuming generation from step ${stepsCompleted + 1} with ${allToolCalls.length} prior tool calls and ${contents.length} prior message blocks`
       );
     }
 
@@ -658,7 +658,7 @@ export class LLMClient {
       } catch (error) {
         if (isRetryableError(error)) {
           logger.debug(
-            `Retryable error at generation step ${step + 1}/${maxSteps}: ${getErrorMessage(error).substring(0, 240)}`
+            `Retryable error at generation step ${step + 1}: ${getErrorMessage(error).substring(0, 240)}`
           );
           throw new GenerationInterruptedError(
             "Generation interrupted by retryable API error; preserving state for resume",
@@ -724,7 +724,7 @@ export class LLMClient {
       }
 
       logger.debug(
-        `Gemini step ${step + 1}/${maxSteps} complete - textParts: ${textParts.length}, functionCalls: ${functionCalls.length}`
+        `Gemini step ${step + 1} complete - textParts: ${textParts.length}, functionCalls: ${functionCalls.length}`
       );
 
       if (functionCalls.length === 0) {

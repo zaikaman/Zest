@@ -4,6 +4,7 @@ import PusherClient from "pusher-js";
 import { SeedstrClient } from "../api/client.js";
 import { getLLMClient } from "../llm/client.js";
 import { getConfig, configStore } from "../config/index.js";
+import { buildHackathonSystemPrompt } from "../prompts/hackathonFrontend.js";
 import { logger } from "../utils/logger.js";
 import { cleanupProject } from "../tools/projectBuilder.js";
 import type { Job, AgentEvent, TokenUsage, FileAttachment, WebSocketJobEvent } from "../types/index.js";
@@ -435,23 +436,16 @@ export class AgentRunner extends EventEmitter implements TypedEventEmitter {
         ? job.budgetPerAgent
         : job.budget;
 
+      const budgetContext = job.jobType === "SWARM"
+        ? ` (your share of $${job.budget.toFixed(2)} total across ${job.maxAgents} agents)`
+        : "";
+
       const result = await llm.generate({
         prompt: job.prompt,
-        systemPrompt: `You are an AI agent participating in the Seedstr marketplace. Your task is to provide the best possible response to job requests.
-
-Guidelines:
-- Be helpful, accurate, and thorough
-- Use tools when needed to get current information
-- Provide well-structured, clear responses
-- Be professional and concise
-- If you use web search, cite your sources
-
-Responding to jobs:
-- Most jobs are asking for TEXT responses — writing, answers, advice, ideas, analysis, tweets, emails, etc. For these, just respond directly with well-written text. Do NOT create files for text-based requests.
-- Only use create_file and finalize_project when the job is genuinely asking for a deliverable code project (a website, app, script, tool, etc.) that the requester would need to download and run/open.
-- Use your judgment to determine what the requester actually wants. "Write me a tweet" = text response. "Build me a landing page" = file project.
-
-Job Budget: $${effectiveBudget.toFixed(2)} USD${job.jobType === "SWARM" ? ` (your share of $${job.budget.toFixed(2)} total across ${job.maxAgents} agents)` : ""}`,
+        systemPrompt: buildHackathonSystemPrompt({
+          budget: effectiveBudget,
+          budgetContext,
+        }),
         tools: true,
       });
 

@@ -3,7 +3,12 @@ import { getConfig } from "../config/index.js";
 import { logger } from "../utils/logger.js";
 import { webSearch, type WebSearchResult } from "../tools/webSearch.js";
 import { calculator, type CalculatorResult } from "../tools/calculator.js";
-import { ProjectBuilder, type ProjectBuildResult } from "../tools/projectBuilder.js";
+import {
+  ProjectBuilder,
+  type ProjectBuildResult,
+  type ProjectBuildValidationResult,
+} from "../tools/projectBuilder.js";
+import { buildHackathonSystemPrompt } from "../prompts/hackathonFrontend.js";
 
 const RETRYABLE_ERROR_PATTERNS = [
   "InvalidToolArgumentsError",
@@ -169,6 +174,7 @@ interface GenerationResumeState {
   usage?: LLMResponse["usage"];
   finalText: string;
   stepsCompleted: number;
+  consecutiveNonProgressTurns: number;
 }
 
 class GenerationInterruptedError extends Error {
@@ -405,6 +411,39 @@ export class LLMClient {
         projectName: z.string().describe("A descriptive name for the project"),
       });
 
+      const validateBuildSchema = z.object({});
+
+      tools.validate_project_build = {
+        description:
+          "Run npm build validation for the generated project and return compiler/build output for debugging.",
+        schema: validateBuildSchema,
+        declaration: {
+          name: "validate_project_build",
+          description:
+            "Run npm install (if needed) and npm run build inside the generated project, returning errors or success output.",
+          parameters: {
+            type: "OBJECT",
+            properties: {},
+            required: [],
+          },
+        },
+        execute: async () => {
+          logger.tool("validate_project_build", "start", "Running npm build validation");
+          if (!activeProjectBuilder) {
+            throw new Error("No files have been created. Use create_file first.");
+          }
+
+          const result: ProjectBuildValidationResult = await activeProjectBuilder.validateNodeBuild();
+          logger.tool(
+            "validate_project_build",
+            result.success ? "success" : "error",
+            result.success ? "Build validation passed" : "Build validation failed"
+          );
+
+          return result;
+        },
+      };
+
       tools.finalize_project = {
         description: "Package all files created with create_file into a downloadable zip.",
         schema: finalizeSchema,
@@ -430,6 +469,19 @@ export class LLMClient {
               throw new Error("No files have been created. Use create_file first.");
             }
 
+            activeProjectBuilder.ensureReadme(projectName);
+
+            const buildValidation = await activeProjectBuilder.validateNodeBuild();
+            if (!buildValidation.success) {
+              return {
+                success: false,
+                projectName,
+                error:
+                  "Build validation failed. Fix project files, rerun validate_project_build, and only then call finalize_project.",
+                buildValidation,
+              };
+            }
+
             const result = await activeProjectBuilder.createZip(`${projectName}.zip`);
             logger.tool("finalize_project", "success", `Created ${result.zipPath} (${result.totalSize} bytes)`);
 
@@ -437,8 +489,10 @@ export class LLMClient {
               success: result.success,
               projectName,
               zipPath: result.zipPath,
+              workspaceProjectDir: result.workspaceProjectDir,
               files: result.files,
               totalSize: result.totalSize,
+              buildValidation,
               error: result.error,
             };
           } catch (error) {
@@ -612,6 +666,7 @@ export class LLMClient {
     const allToolCalls: NonNullable<LLMResponse["toolCalls"]> = resumeState?.allToolCalls || [];
     let usage: LLMResponse["usage"] = resumeState?.usage;
     let finalText = resumeState?.finalText || "";
+    let consecutiveNonProgressTurns = resumeState?.consecutiveNonProgressTurns || 0;
 
     const maxSteps = hasTools ? Infinity : 1;
     let stepsCompleted = resumeState?.stepsCompleted || 0;
@@ -668,6 +723,7 @@ export class LLMClient {
               usage,
               finalText,
               stepsCompleted,
+              consecutiveNonProgressTurns,
             },
             error
           );
@@ -715,7 +771,7 @@ export class LLMClient {
           previousToolCycleSignature = currentCycleSignature;
         }
 
-        if (repeatedToolCycleCount >= 1) {
+        if (repeatedToolCycleCount >= 3) {
           logger.warn(
             `Detected repeated tool-call cycle at step ${step + 1}; stopping further tool iterations to avoid loop`
           );
@@ -728,9 +784,47 @@ export class LLMClient {
       );
 
       if (functionCalls.length === 0) {
+        const hasProjectFiles = !!activeProjectBuilder && activeProjectBuilder.getFiles().length > 0;
+        const hasSuccessfulFinalize = allToolCalls.some(
+          (toolCall) =>
+            toolCall.name === "finalize_project" &&
+            toolCall.result &&
+            typeof toolCall.result === "object" &&
+            (toolCall.result as { success?: boolean }).success === true
+        );
+
+        if (hasTools && hasProjectFiles && !hasSuccessfulFinalize) {
+          consecutiveNonProgressTurns += 1;
+
+          if (consecutiveNonProgressTurns <= 3) {
+            logger.warn(
+              `Model returned no tool calls before finalize (step ${step + 1}, non-progress streak=${consecutiveNonProgressTurns}); nudging to continue build-fix-finalize loop`
+            );
+
+            contents.push({
+              role: "user",
+              parts: [
+                {
+                  text:
+                    "Continue from your last state. The project is not finalized yet. Run validate_project_build, fix any reported compiler/build errors using create_file, repeat validation until it passes, then call finalize_project with a projectName.",
+                },
+              ],
+            });
+
+            stepsCompleted = step + 1;
+            continue;
+          }
+
+          logger.warn(
+            `Stopping after ${consecutiveNonProgressTurns} consecutive non-progress turns before finalize to avoid infinite looping`
+          );
+        }
+
         stepsCompleted = step + 1;
         break;
       }
+
+      consecutiveNonProgressTurns = 0;
 
       if (!hasTools || !tools) {
         throw new Error("Model requested tool call but tools are disabled");
@@ -817,6 +911,7 @@ export class LLMClient {
       const finalizeResult = finalizeCall.result as {
         success: boolean;
         zipPath: string;
+        workspaceProjectDir?: string;
         files: string[];
         totalSize: number;
       };
@@ -827,6 +922,7 @@ export class LLMClient {
           success: true,
           projectDir: builder.getProjectDir(),
           zipPath: finalizeResult.zipPath,
+          workspaceProjectDir: finalizeResult.workspaceProjectDir,
           files: finalizeResult.files,
           totalSize: finalizeResult.totalSize,
         };
@@ -846,17 +942,9 @@ export class LLMClient {
   }
 
   async generateJobResponse(job: { prompt: string; budget: number }): Promise<string> {
-    const systemPrompt = `You are an AI agent participating in the Seedstr marketplace. Your task is to provide the best possible response to job requests.
-
-Guidelines:
-- Be helpful, accurate, and thorough
-- Use tools when needed to get current information
-- Provide well-structured, clear responses
-- Be professional and concise
-- If you use web search, cite your sources
-
-Job Budget: $${job.budget.toFixed(2)} USD
-This indicates how much the requester values this task. Adjust your effort accordingly.`;
+    const systemPrompt = buildHackathonSystemPrompt({
+      budget: job.budget,
+    });
 
     const result = await this.generate({
       prompt: job.prompt,

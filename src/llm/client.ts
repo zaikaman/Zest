@@ -392,6 +392,7 @@ export class LLMClient {
               path,
               size: content.length,
               totalFiles: files.length,
+              allFiles: files,
             };
           } catch (error) {
             logger.tool("create_file", "error", String(error));
@@ -614,6 +615,8 @@ export class LLMClient {
 
     const maxSteps = hasTools ? 10 : 1;
     let stepsCompleted = resumeState?.stepsCompleted || 0;
+    let previousToolCycleSignature = "";
+    let repeatedToolCycleCount = 0;
 
     if (resumeState) {
       logger.debug(
@@ -700,6 +703,24 @@ export class LLMClient {
         logger.debug(
           `Gemini requested tool calls at step ${step + 1}: ${functionCalls.map((call) => call.name).join(", ")}`
         );
+
+        const currentCycleSignature = functionCalls
+          .map((call) => `${call.name}:${JSON.stringify(call.args || {})}`)
+          .join("|");
+
+        if (currentCycleSignature === previousToolCycleSignature) {
+          repeatedToolCycleCount++;
+        } else {
+          repeatedToolCycleCount = 0;
+          previousToolCycleSignature = currentCycleSignature;
+        }
+
+        if (repeatedToolCycleCount >= 1) {
+          logger.warn(
+            `Detected repeated tool-call cycle at step ${step + 1}; stopping further tool iterations to avoid loop`
+          );
+          break;
+        }
       }
 
       logger.debug(
@@ -715,8 +736,9 @@ export class LLMClient {
         throw new Error("Model requested tool call but tools are disabled");
       }
 
-      const modelFunctionParts: Array<{ functionCall: { name: string; args: Record<string, unknown> } }> = [];
       const functionResponseParts: Array<{ functionResponse: { name: string; response: Record<string, unknown> } }> = [];
+
+      let finalizedProjectThisStep = false;
 
       for (const functionCall of functionCalls) {
         const toolDef = tools[functionCall.name];
@@ -751,12 +773,14 @@ export class LLMClient {
           `Tool result recorded for ${functionCall.name}: ${JSON.stringify(toolResult).substring(0, 220)}`
         );
 
-        modelFunctionParts.push({
-          functionCall: {
-            name: functionCall.name,
-            args,
-          },
-        });
+        if (
+          functionCall.name === "finalize_project" &&
+          toolResult &&
+          typeof toolResult === "object" &&
+          (toolResult as { success?: boolean }).success === true
+        ) {
+          finalizedProjectThisStep = true;
+        }
 
         functionResponseParts.push({
           functionResponse: {
@@ -769,25 +793,17 @@ export class LLMClient {
         });
       }
 
-      const hasFinalizeCall = functionCalls.some((call) => call.name === "finalize_project");
-      if (hasFinalizeCall && finalText) {
-        logger.info(
-          "Short-circuiting post-tool follow-up request after finalize_project; using existing model text and tool outputs"
-        );
-        stepsCompleted = step + 1;
-        break;
-      }
-
-      contents.push({
-        role: "model",
-        parts: modelFunctionParts,
-      });
       contents.push({
         role: "user",
         parts: functionResponseParts,
       });
 
       stepsCompleted = step + 1;
+
+      if (finalizedProjectThisStep) {
+        logger.info("Project finalized successfully; stopping tool loop early");
+        break;
+      }
     }
 
     if (!finalText && allToolCalls.length > 0) {

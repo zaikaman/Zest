@@ -60,6 +60,11 @@ export class ProjectBuilder {
         cwd: this.projectDir,
         timeout: timeoutMs,
         maxBuffer: 1024 * 1024 * 8,
+        env: {
+          ...process.env,
+          NPM_CONFIG_PRODUCTION: "false",
+          NODE_ENV: process.env.NODE_ENV || "development",
+        },
       });
 
       const combined = `${stdout || ""}${stderr || ""}`;
@@ -195,12 +200,16 @@ ${fileList || "- (project files generated during build)"}
     let installRan = false;
     if (!existsSync(nodeModulesPath)) {
       installRan = true;
-      const installResult = await this.runCommand("npm", ["install", "--no-audit", "--no-fund"], 240000);
+      const installResult = await this.runCommand(
+        "npm",
+        ["install", "--include=dev", "--no-audit", "--no-fund"],
+        240000
+      );
       if (!installResult.success) {
         return {
           success: false,
           projectDir: this.projectDir,
-          output: `npm install failed:\n${installResult.output}`.slice(0, 16000),
+          output: `npm install failed:\n${installResult.output}\n\nHint: This validator forces devDependencies (Heroku/runtime safe mode). If failures persist, check network/package registry access or package lock compatibility.`.slice(0, 16000),
           installRan,
           buildScriptDetected,
         };

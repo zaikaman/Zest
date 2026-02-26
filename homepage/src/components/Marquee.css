@@ -1,0 +1,34 @@
+.marquee-container {
+    width: 100vw;
+    overflow: hidden;
+    background-color: var(--acid-yellow);
+    color: var(--bg-color);
+    padding: 0.5rem 0;
+    border-top: var(--structural-border);
+    border-bottom: var(--structural-border);
+    position: relative;
+    left: 50%;
+    right: 50%;
+    margin-left: -50vw;
+    margin-right: -50vw;
+}
+
+.marquee-content {
+    display: flex;
+    white-space: nowrap;
+    animation: marquee 15s linear infinite;
+    font-family: var(--font-display);
+    font-weight: 800;
+    font-size: 1.5rem;
+    letter-spacing: 0.05em;
+}
+
+.marquee-content.reverse {
+    animation-direction: reverse;
+    background-color: var(--highlighter-orange);
+    color: var(--bg-color);
+}
+
+.marquee-content span {
+    padding: 0 2rem;
+}

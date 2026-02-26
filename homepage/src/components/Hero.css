@@ -1,0 +1,137 @@
+.hero-section {
+    min-height: 80vh;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+}
+
+.hero-grid {
+    flex: 1;
+}
+
+.hero-content-left {
+    grid-column: span 7;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    position: relative;
+    overflow: hidden;
+}
+
+.massive-title {
+    font-size: clamp(4rem, 8vw, 11rem);
+    line-height: 1;
+    margin-left: -1rem;
+    color: var(--text-primary);
+    text-shadow: 4px 4px 0px var(--bg-secondary);
+}
+
+.agent-status {
+    margin-top: 3rem;
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    font-family: var(--font-mono);
+    font-size: 1.2rem;
+}
+
+.status-dot {
+    width: 12px;
+    height: 12px;
+    background-color: var(--acid-yellow);
+    box-shadow: 0 0 10px var(--acid-yellow);
+}
+
+.blink {
+    animation: blink 1.5s infinite;
+}
+
+@keyframes blink {
+
+    0%,
+    100% {
+        opacity: 1;
+    }
+
+    50% {
+        opacity: 0.2;
+    }
+}
+
+.hero-content-right {
+    grid-column: span 5;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    background-color: var(--bg-secondary);
+}
+
+.terminal-box {
+    border: var(--structural-border);
+    background-color: var(--bg-color);
+    font-family: var(--font-mono);
+    margin-bottom: 2rem;
+}
+
+.terminal-header {
+    border-bottom: var(--structural-border);
+    padding: 0.5rem 1rem;
+    display: flex;
+    justify-content: space-between;
+    background-color: var(--bg-secondary);
+    color: var(--text-muted);
+    font-size: 0.9rem;
+}
+
+.terminal-controls {
+    display: flex;
+    gap: 0.8rem;
+}
+
+.terminal-body {
+    padding: 1.5rem;
+    font-size: clamp(0.7rem, 1.3vw, 1rem);
+    line-height: 1.6;
+}
+
+.terminal-body p {
+    margin-bottom: 0.5rem;
+}
+
+.cursor {
+    animation: blink 1s step-end infinite;
+    color: var(--acid-yellow);
+    font-weight: bold;
+}
+
+.type-effect p {
+    overflow: hidden;
+    white-space: nowrap;
+    animation: typing 2s steps(40, end);
+}
+
+@keyframes typing {
+    from {
+        width: 0
+    }
+
+    to {
+        width: 100%
+    }
+}
+
+.hero-actions {
+    display: flex;
+    justify-content: flex-end;
+}
+
+@media (max-width: 1024px) {
+    .hero-content-left {
+        grid-column: span 12;
+    }
+
+    .hero-content-right {
+        grid-column: span 12;
+        border-left: none;
+    }
+}

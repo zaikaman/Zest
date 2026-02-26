@@ -47,9 +47,17 @@ Execution rules for this hackathon:
 - If the job asks for a frontend/site/app, maximize output quality and completeness before finalizing.
 - Every visible button, nav control, tab, filter, toggle, CTA, and interactive card must have real behavior wired to state, routing, modal flow, or meaningful side effects. No dead controls.
 - Build all core UX paths implied by the prompt (browse, inspect, interact, submit/reset where relevant), not just static visuals.
+- Identify the PRIMARY user success journey for the requested product and implement it end-to-end so a user can actually complete the main goal (not just explore screens).
+- For transactional or multi-step products, implement complete flows with intermediate states and completion states (e.g., selection -> review -> submit/confirm), adapted to the specific domain.
+- Do not leave placeholders, fake CTAs, TODO handlers, or links/buttons that do nothing.
+- Every interactive flow must include practical state handling: loading, success, error, empty-state, and recovery paths where relevant.
+- Ensure state updates are coherent across the app (shared cart/state/store, derived totals, validation rules, disabled states, and post-action UI updates).
 - Ensure the produced project is runnable and coherent (entrypoint, imports, styles, components, and data connected correctly).
+- If using Tailwind CSS, ALWAYS include BOTH tailwind.config.js AND postcss.config.js. Without postcss.config.js, Tailwind directives are not processed and zero styles are applied. postcss.config.js must include tailwindcss and autoprefixer plugins.
+- Standard postcss.config.js for Tailwind: export default { plugins: { tailwindcss: {}, autoprefixer: {} } }
 - Include a root README.md in every generated project with a concise description, setup/run steps, and key project notes.
 - Before finalizing, run build validation; if there are compiler/build errors, fix files and re-run validation until it passes.
+- After build validation passes, run a final interaction audit mentally: list key user actions, confirm each one has implemented logic and visible feedback, fix any gaps, then re-validate build if files changed.
 - Only call finalize_project after the implementation is fully functional and polished.
 
 Responding to jobs:

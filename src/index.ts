@@ -6,12 +6,32 @@
  * For CLI commands, see src/cli/index.ts
  */
 
-import { getConfig, validateConfig, isRegistered, isVerified } from "./config/index.js";
+import { getConfig, validateConfig, isRegistered, isVerified, saveVerification } from "./config/index.js";
 import { AgentRunner } from "./agent/runner.js";
+import { SeedstrClient } from "./api/client.js";
 import { startTUI } from "./tui/index.js";
 import { logger } from "./utils/logger.js";
 import chalk from "chalk";
 import figlet from "figlet";
+
+async function getLiveVerificationStatus(): Promise<boolean> {
+  const fallback = isVerified();
+
+  try {
+    const client = new SeedstrClient();
+    const me = await client.getMe();
+    const liveVerified = me.verification?.isVerified ?? me.isVerified ?? false;
+    saveVerification(liveVerified);
+    return liveVerified;
+  } catch (error) {
+    logger.warn(
+      `Could not fetch live verification status from Seedstr API; using local/env status instead: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+    return fallback;
+  }
+}
 
 async function main() {
   // Display banner
@@ -45,8 +65,9 @@ async function main() {
     process.exit(1);
   }
 
-  // Check verification (warning only)
-  if (!isVerified()) {
+  // Check verification (warning only) — prefer live API status
+  const verified = await getLiveVerificationStatus();
+  if (!verified) {
     console.log(chalk.yellow("⚠ Agent is not verified."));
     console.log(chalk.gray("You won't be able to respond to jobs until verified."));
     console.log(chalk.gray("Run `npm run verify` to verify via Twitter.\n"));

@@ -100,6 +100,60 @@ npm start
 npm start -- --no-tui
 ```
 
+## Deploy to Heroku (24/7 Worker)
+
+This project is configured to run as a background worker dyno on Heroku:
+
+- `Procfile` uses: `worker: NO_TUI=true npm start`
+- `npm start` runs compiled output: `node dist/index.js`
+- `heroku-postbuild` compiles during deploy
+
+### 1) Create app + choose stack
+
+```bash
+heroku create your-agent-name
+heroku stack:set heroku-24 -a your-agent-name
+```
+
+### 2) Set required config vars
+
+```bash
+heroku config:set GEMINI_API_KEY=... -a your-agent-name
+heroku config:set GEMINI_API_BASE_URL=https://v98store.com/v1beta -a your-agent-name
+heroku config:set SOLANA_WALLET_ADDRESS=... -a your-agent-name
+heroku config:set SEEDSTR_API_KEY=... -a your-agent-name
+
+# Seedstr API split (recommended)
+heroku config:set SEEDSTR_API_URL=https://www.seedstr.io/api/v1 -a your-agent-name
+heroku config:set SEEDSTR_API_URL_V2=https://www.seedstr.io/api/v2 -a your-agent-name
+
+# Agent behavior
+heroku config:set POLL_INTERVAL=180 -a your-agent-name
+heroku config:set USE_WEBSOCKET=false -a your-agent-name
+```
+
+If Seedstr provides WebSocket credentials, enable it:
+
+```bash
+heroku config:set USE_WEBSOCKET=true -a your-agent-name
+heroku config:set PUSHER_KEY=... -a your-agent-name
+heroku config:set PUSHER_CLUSTER=us2 -a your-agent-name
+```
+
+### 3) Deploy + scale worker
+
+```bash
+git push heroku main
+heroku ps:scale worker=1 -a your-agent-name
+heroku logs --tail -a your-agent-name
+```
+
+### 4) Verify agent is ready
+
+Before expecting jobs, make sure your agent is registered + verified and has skills set.
+
+> Note: “24/7” requires a paid dyno type (for example Basic/Standard). Eco dynos are quota-based and may not run continuously all month.
+
 ## Extras
 Read our docs on agent fine tuning to learn how to decline/accept jobs based on budget to complexity ratio. https://www.seedstr.io/docs#agent-fine-tuning
 

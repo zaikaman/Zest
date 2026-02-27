@@ -54,7 +54,7 @@ export function getConfig(): AgentConfig {
     // Agent behavior
     minBudget: parseFloat(process.env.MIN_BUDGET || "0.50"),
     maxConcurrentJobs: parseInt(process.env.MAX_CONCURRENT_JOBS || "3", 10),
-    pollInterval: parseInt(process.env.POLL_INTERVAL || "30", 10),
+    pollInterval: parseInt(process.env.POLL_INTERVAL || "180", 10),
 
     // Tools
     tools: {
@@ -66,7 +66,7 @@ export function getConfig(): AgentConfig {
 
     // Platform
     seedstrApiUrl: process.env.SEEDSTR_API_URL || "https://www.seedstr.io/api/v1",
-    seedstrApiUrlV2: (process.env.SEEDSTR_API_URL || "https://www.seedstr.io/api/v2"),
+    seedstrApiUrlV2: process.env.SEEDSTR_API_URL_V2 || "https://www.seedstr.io/api/v2",
 
     // WebSocket (Pusher)
     useWebSocket: process.env.USE_WEBSOCKET !== "false", // enabled by default

@@ -207,6 +207,67 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function truncateText(input: string, maxLength: number): string {
+  if (input.length <= maxLength) return input;
+  return `${input.slice(0, maxLength)}\n...[truncated ${input.length - maxLength} chars]`;
+}
+
+function compactToolResultForModel(toolName: string, toolResult: unknown): Record<string, unknown> {
+  if (toolName === "create_file" && isPlainObject(toolResult)) {
+    return {
+      success: toolResult.success,
+      path: toolResult.path,
+      size: toolResult.size,
+      totalFiles: toolResult.totalFiles,
+    };
+  }
+
+  if (toolName === "validate_project_build" && isPlainObject(toolResult)) {
+    const output = typeof toolResult.output === "string" ? toolResult.output : "";
+    return {
+      success: toolResult.success,
+      projectDir: toolResult.projectDir,
+      installRan: toolResult.installRan,
+      buildScriptDetected: toolResult.buildScriptDetected,
+      output: truncateText(output, 3000),
+    };
+  }
+
+  if (toolName === "web_search" && Array.isArray(toolResult)) {
+    return {
+      results: toolResult.slice(0, 5).map((item) => {
+        if (!isPlainObject(item)) return { value: String(item) };
+        return {
+          title: typeof item.title === "string" ? truncateText(item.title, 180) : "",
+          url: typeof item.url === "string" ? item.url : "",
+          snippet: typeof item.snippet === "string" ? truncateText(item.snippet, 320) : "",
+        };
+      }),
+      totalResults: toolResult.length,
+    };
+  }
+
+  if (toolName === "finalize_project" && isPlainObject(toolResult)) {
+    const files = Array.isArray(toolResult.files) ? toolResult.files : [];
+    return {
+      success: toolResult.success,
+      projectName: toolResult.projectName,
+      zipPath: toolResult.zipPath,
+      workspaceProjectDir: toolResult.workspaceProjectDir,
+      totalSize: toolResult.totalSize,
+      fileCount: files.length,
+      filesPreview: files.slice(0, 20),
+      error: toolResult.error,
+    };
+  }
+
+  if (isPlainObject(toolResult)) {
+    return toolResult;
+  }
+
+  return { result: toolResult };
+}
+
 export class LLMClient {
   private apiKey: string;
   private apiBaseUrl: string;
@@ -889,7 +950,7 @@ export class LLMClient {
         functionResponseParts.push({
           functionResponse: {
             name: functionCall.name,
-            response: isPlainObject(toolResult) ? toolResult : { result: toolResult },
+            response: compactToolResultForModel(functionCall.name, toolResult),
           },
         });
       }

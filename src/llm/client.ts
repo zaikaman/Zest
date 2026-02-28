@@ -203,6 +203,10 @@ function getErrorMessage(error: unknown): string {
   return String(error);
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 export class LLMClient {
   private apiKey: string;
   private apiBaseUrl: string;
@@ -411,7 +415,9 @@ export class LLMClient {
         projectName: z.string().describe("A descriptive name for the project"),
       });
 
-      const validateBuildSchema = z.object({});
+      const validateBuildSchema = z.object({
+        trigger: z.string().optional().describe("Optional note for when to run build validation"),
+      });
 
       tools.validate_project_build = {
         description:
@@ -423,8 +429,12 @@ export class LLMClient {
             "Run npm install (if needed) and npm run build inside the generated project, returning errors or success output.",
           parameters: {
             type: "OBJECT",
-            properties: {},
-            required: [],
+            properties: {
+              trigger: {
+                type: "STRING",
+                description: "Optional note for when this validation run was requested",
+              },
+            },
           },
         },
         execute: async () => {
@@ -879,10 +889,7 @@ export class LLMClient {
         functionResponseParts.push({
           functionResponse: {
             name: functionCall.name,
-            response:
-              toolResult && typeof toolResult === "object"
-                ? (toolResult as Record<string, unknown>)
-                : { result: toolResult },
+            response: isPlainObject(toolResult) ? toolResult : { result: toolResult },
           },
         });
       }

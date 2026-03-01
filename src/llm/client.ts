@@ -212,6 +212,109 @@ function truncateText(input: string, maxLength: number): string {
   return `${input.slice(0, maxLength)}\n...[truncated ${input.length - maxLength} chars]`;
 }
 
+const MAX_GATEWAY_PAYLOAD_BYTES = 16000;
+
+function pruneForGateway(value: unknown, depth = 0): unknown {
+  if (depth >= 4) {
+    return "[truncated-depth]";
+  }
+
+  if (typeof value === "string") {
+    return truncateText(value, 500);
+  }
+
+  if (Array.isArray(value)) {
+    return value.slice(0, 6).map((item) => pruneForGateway(item, depth + 1));
+  }
+
+  if (isPlainObject(value)) {
+    const entries = Object.entries(value).slice(0, 12);
+    const compacted = Object.fromEntries(
+      entries.map(([key, item]) => [key, pruneForGateway(item, depth + 1)])
+    );
+    return compacted;
+  }
+
+  return value;
+}
+
+function compactContentsForGateway(
+  contents: Array<{
+    role: "user" | "model";
+    parts: Array<
+      | { text: string }
+      | { functionCall: { name: string; args: Record<string, unknown> } }
+      | { functionResponse: { name: string; response: Record<string, unknown> } }
+    >;
+  }>,
+  keepRecentUserTurns = 2,
+): Array<{
+  role: "user" | "model";
+  parts: Array<
+    | { text: string }
+    | { functionCall: { name: string; args: Record<string, unknown> } }
+    | { functionResponse: { name: string; response: Record<string, unknown> } }
+  >;
+}> {
+  if (contents.length <= 3) {
+    return contents.map((message) => ({
+      role: message.role,
+      parts: message.parts.map((part) => {
+        if ("text" in part) {
+          return { text: truncateText(part.text, 800) };
+        }
+
+        if ("functionCall" in part) {
+          return {
+            functionCall: {
+              name: part.functionCall.name,
+              args: pruneForGateway(part.functionCall.args) as Record<string, unknown>,
+            },
+          };
+        }
+
+        return {
+          functionResponse: {
+            name: part.functionResponse.name,
+            response: pruneForGateway(part.functionResponse.response) as Record<string, unknown>,
+          },
+        };
+      }),
+    }));
+  }
+
+  const first = contents[0];
+  const recent = contents.slice(-Math.max(1, keepRecentUserTurns));
+  const compacted = [first, ...recent].map((message) => ({
+    role: message.role,
+    parts: message.parts
+      .slice(-8)
+      .map((part) => {
+        if ("text" in part) {
+          return { text: truncateText(part.text, 800) };
+        }
+
+        if ("functionCall" in part) {
+          return {
+            functionCall: {
+              name: part.functionCall.name,
+              args: pruneForGateway(part.functionCall.args) as Record<string, unknown>,
+            },
+          };
+        }
+
+        return {
+          functionResponse: {
+            name: part.functionResponse.name,
+            response: pruneForGateway(part.functionResponse.response) as Record<string, unknown>,
+          },
+        };
+      }),
+  }));
+
+  return compacted;
+}
+
 function compactToolResultForModel(toolName: string, toolResult: unknown): Record<string, unknown> {
   if (toolName === "create_file" && isPlainObject(toolResult)) {
     return {
@@ -613,6 +716,19 @@ export class LLMClient {
 
         if (error instanceof GenerationInterruptedError) {
           resumeState = error.state;
+
+          const rootCause = error.cause;
+          const apiError = rootCause instanceof GeminiApiError ? rootCause : null;
+          if (apiError && (apiError.status === 429 || apiError.status >= 500)) {
+            const compactedContents = compactContentsForGateway(resumeState.contents, 1);
+            if (compactedContents.length <= resumeState.contents.length) {
+              resumeState.contents = compactedContents;
+              logger.warn(
+                `Applied aggressive resume-state compaction after ${apiError.status} to improve retry compatibility (messageBlocks=${resumeState.contents.length})`
+              );
+            }
+          }
+
           logger.debug(
             `Preserved resume state: stepsCompleted=${resumeState.stepsCompleted}, toolCalls=${resumeState.allToolCalls.length}, hasText=${resumeState.finalText.length > 0}`
           );
@@ -720,7 +836,7 @@ export class LLMClient {
     const { prompt, systemPrompt, maxTokens, temperature, tools, resumeState } = params;
     const hasTools = !!tools && Object.keys(tools).length > 0;
 
-    const contents: Array<{
+    let contents: Array<{
       role: "user" | "model";
       parts: Array<
         | { text: string }
@@ -728,11 +844,11 @@ export class LLMClient {
         | { functionResponse: { name: string; response: Record<string, unknown> } }
       >;
     }> = resumeState?.contents || [
-        {
-          role: "user",
-          parts: [{ text: prompt }],
-        },
-      ];
+      {
+        role: "user",
+        parts: [{ text: prompt }],
+      },
+    ];
 
     const allToolCalls: NonNullable<LLMResponse["toolCalls"]> = resumeState?.allToolCalls || [];
     let usage: LLMResponse["usage"] = resumeState?.usage;
@@ -751,7 +867,7 @@ export class LLMClient {
     }
 
     for (let step = stepsCompleted; step < maxSteps; step++) {
-      const payload: Record<string, unknown> = {
+      let payload: Record<string, unknown> = {
         contents,
         generationConfig: {
           temperature,
@@ -776,6 +892,25 @@ export class LLMClient {
             mode: "AUTO",
           },
         };
+      }
+
+      let payloadBytes = JSON.stringify(payload).length;
+      if (hasTools && payloadBytes > MAX_GATEWAY_PAYLOAD_BYTES) {
+        const compactedContents = compactContentsForGateway(contents);
+        const compactedPayload: Record<string, unknown> = {
+          ...payload,
+          contents: compactedContents,
+        };
+        const compactedPayloadBytes = JSON.stringify(compactedPayload).length;
+
+        if (compactedPayloadBytes < payloadBytes) {
+          logger.warn(
+            `Compacted tool-loop payload at step ${step + 1} from ${payloadBytes} bytes to ${compactedPayloadBytes} bytes to improve gateway compatibility`
+          );
+          contents = compactedContents;
+          payload = compactedPayload;
+          payloadBytes = compactedPayloadBytes;
+        }
       }
 
       let result: GeminiResponse;

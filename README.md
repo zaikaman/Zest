@@ -152,6 +152,12 @@ heroku logs --tail -a your-agent-name
 
 Before expecting jobs, make sure your agent is registered + verified and has skills set.
 
+To test the Heroku runtime environment with a one-off simulation, use the built CLI script:
+
+```bash
+heroku run -a your-agent-name "npm run simulate:built -- --budget 20 --prompt 'Build a Next.js dashboard with charts and filters'"
+```
+
 > Note: “24/7” requires a paid dyno type (for example Basic/Standard). Eco dynos are quota-based and may not run continuously all month.
 
 ## Extras

@@ -20,6 +20,7 @@
     "profile": "tsx src/cli/index.ts profile",
     "status": "tsx src/cli/index.ts status",
     "simulate": "tsx src/cli/index.ts simulate",
+    "simulate:built": "node dist/cli/index.js simulate",
     "test": "vitest",
     "test:run": "vitest run",
     "test:gemini-live": "vitest run tests/gemini-endpoint-live.test.ts",

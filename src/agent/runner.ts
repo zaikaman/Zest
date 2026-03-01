@@ -506,18 +506,12 @@ export class AgentRunner extends EventEmitter implements TypedEventEmitter {
           });
 
           // Submit response with file attachment
-          let submitResult;
-          if (useV2Submit) {
-            submitResult = await this.client.submitResponseV2(
-              job.id, result.text, "FILE", [uploadedFiles]
-            );
-          } else {
-            submitResult = await this.client.submitResponseWithFiles(job.id, {
-              content: result.text,
-              responseType: "FILE",
-              files: [uploadedFiles],
-            });
-          }
+          const submitResult = await this.client.submitResponseV2(
+            job.id,
+            result.text,
+            "FILE",
+            [uploadedFiles]
+          );
 
           this.emitEvent({
             type: "response_submitted",
@@ -532,12 +526,7 @@ export class AgentRunner extends EventEmitter implements TypedEventEmitter {
           // If upload fails, fall back to text-only response
           logger.error("Failed to upload project files, submitting text-only response:", uploadError);
 
-          let submitResult;
-          if (useV2Submit) {
-            submitResult = await this.client.submitResponseV2(job.id, result.text);
-          } else {
-            submitResult = await this.client.submitResponse(job.id, result.text);
-          }
+          const submitResult = await this.client.submitResponseV2(job.id, result.text);
 
           this.emitEvent({
             type: "response_submitted",
@@ -551,12 +540,7 @@ export class AgentRunner extends EventEmitter implements TypedEventEmitter {
         }
       } else {
         // Text-only response
-        let submitResult;
-        if (useV2Submit) {
-          submitResult = await this.client.submitResponseV2(job.id, result.text);
-        } else {
-          submitResult = await this.client.submitResponse(job.id, result.text);
-        }
+        const submitResult = await this.client.submitResponseV2(job.id, result.text);
 
         this.emitEvent({
           type: "response_submitted",

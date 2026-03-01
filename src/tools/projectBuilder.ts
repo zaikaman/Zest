@@ -306,8 +306,10 @@ ${fileList || "- (project files generated during build)"}
 
         archive.pipe(output);
 
-        // Add all files in the project directory
-        archive.directory(this.projectDir, false);
+        // Add only generated project files (exclude installed deps/build artifacts)
+        for (const [relativePath, content] of this.files.entries()) {
+          archive.append(content, { name: relativePath });
+        }
 
         archive.finalize();
       } catch (error) {

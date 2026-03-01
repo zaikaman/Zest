@@ -76,14 +76,14 @@ export class SeedstrClient {
     return this.request<RegisterResponse>("/register", {
       method: "POST",
       body: JSON.stringify({ walletAddress, ownerUrl }),
-    });
+    }, true);
   }
 
   /**
    * Get current agent information
    */
   async getMe(): Promise<AgentInfo> {
-    return this.request<AgentInfo>("/me");
+    return this.request<AgentInfo>("/me", {}, true);
   }
 
   /**
@@ -97,7 +97,7 @@ export class SeedstrClient {
     return this.request<UpdateProfileResponse>("/me", {
       method: "PATCH",
       body: JSON.stringify(data),
-    });
+    }, true);
   }
 
   /**
@@ -106,14 +106,14 @@ export class SeedstrClient {
   async verify(): Promise<VerifyResponse> {
     return this.request<VerifyResponse>("/verify", {
       method: "POST",
-    });
+    }, true);
   }
 
   /**
    * List available jobs (v1)
    */
   async listJobs(limit = 20, offset = 0): Promise<JobsListResponse> {
-    return this.request<JobsListResponse>(`/jobs?limit=${limit}&offset=${offset}`);
+    return this.request<JobsListResponse>(`/jobs?limit=${limit}&offset=${offset}`, {}, true);
   }
 
   /**
@@ -134,7 +134,7 @@ export class SeedstrClient {
    * Get a specific job by ID (v1)
    */
   async getJob(jobId: string): Promise<Job> {
-    return this.request<Job>(`/jobs/${jobId}`);
+    return this.request<Job>(`/jobs/${jobId}`, {}, true);
   }
 
   /**
@@ -163,7 +163,7 @@ export class SeedstrClient {
     return this.request<UpdateProfileResponse>("/me", {
       method: "PATCH",
       body: JSON.stringify({ skills }),
-    });
+    }, true);
   }
 
   /**
@@ -176,7 +176,7 @@ export class SeedstrClient {
     return this.request<SubmitResponseResult>(`/jobs/${jobId}/respond`, {
       method: "POST",
       body: JSON.stringify({ content, responseType: "TEXT" }),
-    });
+    }, true);
   }
 
   /**
@@ -215,7 +215,7 @@ export class SeedstrClient {
     return this.request<SubmitResponseResult>(`/jobs/${jobId}/respond`, {
       method: "POST",
       body: JSON.stringify(body),
-    });
+    }, true);
   }
 
   /**
@@ -257,8 +257,8 @@ export class SeedstrClient {
     const fileBuffer = readFileSync(filePath);
     const base64Content = fileBuffer.toString("base64");
 
-    // Upload to the v1/upload endpoint (server-side upload API)
-    const uploadUrl = `${config.seedstrApiUrl}/upload`;
+    // Upload via v2 endpoint
+    const uploadUrl = `${config.seedstrApiUrlV2}/upload`;
     
     const response = await fetch(uploadUrl, {
       method: "POST",

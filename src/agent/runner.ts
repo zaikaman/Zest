@@ -6,6 +6,7 @@ import { getLLMClient } from "../llm/client.js";
 import { getConfig, configStore } from "../config/index.js";
 import { buildHackathonSystemPrompt } from "../prompts/hackathonFrontend.js";
 import { logger } from "../utils/logger.js";
+import { TelegramNotifier } from "../utils/telegram.js";
 import { cleanupProject } from "../tools/projectBuilder.js";
 import type { Job, AgentEvent, TokenUsage, FileAttachment, WebSocketJobEvent } from "../types/index.js";
 
@@ -59,6 +60,7 @@ export class AgentRunner extends EventEmitter implements TypedEventEmitter {
   private processedJobs: Set<string>;
   private pusher: PusherClient | null = null;
   private wsConnected = false;
+  private telegramNotifier: TelegramNotifier;
   private stats = {
     jobsProcessed: 0,
     jobsSkipped: 0,
@@ -77,6 +79,14 @@ export class AgentRunner extends EventEmitter implements TypedEventEmitter {
     // Load previously processed jobs from persistent storage
     const stored = jobStore.get("processedJobs") || [];
     this.processedJobs = new Set(stored);
+
+    const config = getConfig();
+    this.telegramNotifier = new TelegramNotifier(
+      config.telegramBotToken,
+      config.telegramChatId,
+      config.telegramLogsEnabled
+    );
+
     logger.debug(`Loaded ${this.processedJobs.size} previously processed jobs`);
   }
 
@@ -102,6 +112,56 @@ export class AgentRunner extends EventEmitter implements TypedEventEmitter {
    */
   private emitEvent(event: AgentEvent): void {
     this.emit("event", event);
+    this.sendTelegramJobLog(event);
+  }
+
+  private sendTelegramJobLog(event: AgentEvent): void {
+    if (!this.telegramNotifier.isEnabled()) {
+      return;
+    }
+
+    let message: string | null = null;
+
+    switch (event.type) {
+      case "job_found":
+        message = `🆕 Job found\nID: ${event.job.id}\nBudget: $${event.job.budget.toFixed(2)}`;
+        break;
+      case "job_accepted":
+        message = `✅ Swarm job accepted\nID: ${event.job.id}\nPer-agent budget: ${event.budgetPerAgent ?? "n/a"}`;
+        break;
+      case "job_processing":
+        message = `⚙️ Processing job\nID: ${event.job.id}`;
+        break;
+      case "job_skipped":
+        message = `⏭️ Job skipped\nID: ${event.job.id}\nReason: ${event.reason}`;
+        break;
+      case "response_generated":
+        message = `🧠 Response generated\nID: ${event.job.id}\nPreview: ${event.preview.substring(0, 180)}`;
+        break;
+      case "project_built":
+        message = `📦 Project built\nID: ${event.job.id}\nFiles: ${event.files.length}`;
+        break;
+      case "files_uploading":
+        message = `⬆️ Uploading files\nID: ${event.job.id}\nCount: ${event.fileCount}`;
+        break;
+      case "files_uploaded":
+        message = `☁️ Files uploaded\nID: ${event.job.id}\nCount: ${event.files.length}`;
+        break;
+      case "response_submitted":
+        message = `🎉 Response submitted\nID: ${event.job.id}\nResponse: ${event.responseId}\nHas files: ${event.hasFiles ? "yes" : "no"}`;
+        break;
+      case "error":
+        if (event.message.toLowerCase().includes("job")) {
+          message = `❌ Job error\n${event.message}`;
+        }
+        break;
+      default:
+        break;
+    }
+
+    if (message) {
+      this.telegramNotifier.send(message);
+    }
   }
 
   // ─────────────────────────────────────────

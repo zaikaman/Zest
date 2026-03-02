@@ -199,6 +199,9 @@ export interface AgentConfig {
   // Logging
   logLevel: "debug" | "info" | "warn" | "error";
   debug: boolean;
+  telegramLogsEnabled: boolean;
+  telegramBotToken: string;
+  telegramChatId: string;
 
   // LLM retry settings (for recovering from transient tool argument parsing errors)
   llmRetryMaxAttempts: number;

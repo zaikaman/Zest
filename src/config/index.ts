@@ -76,6 +76,9 @@ export function getConfig(): AgentConfig {
     // Logging
     logLevel: (process.env.LOG_LEVEL as AgentConfig["logLevel"]) || "info",
     debug: process.env.DEBUG === "true",
+    telegramLogsEnabled: process.env.TELEGRAM_LOGS_ENABLED === "true",
+    telegramBotToken: process.env.TELEGRAM_BOT_TOKEN || "",
+    telegramChatId: process.env.TELEGRAM_CHAT_ID || "",
 
     // LLM retry settings (for recovering from transient tool argument parsing errors)
     llmRetryMaxAttempts: parseInt(process.env.LLM_RETRY_MAX_ATTEMPTS || "100", 10),

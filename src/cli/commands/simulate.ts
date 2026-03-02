@@ -5,6 +5,7 @@ import { getConfig } from "../../config/index.js";
 import { getLLMClient } from "../../llm/client.js";
 import { buildHackathonSystemPrompt } from "../../prompts/hackathonFrontend.js";
 import { cleanupProject } from "../../tools/projectBuilder.js";
+import { TelegramNotifier } from "../../utils/telegram.js";
 import type { Job, TokenUsage } from "../../types/index.js";
 
 const MODEL_COSTS: Record<string, { input: number; output: number }> = {
@@ -39,6 +40,11 @@ export async function simulateCommand(options: SimulateOptions): Promise<void> {
   console.log(chalk.gray("  but nothing is submitted to the platform.\n"));
 
   const config = getConfig();
+  const telegramNotifier = new TelegramNotifier(
+    config.telegramBotToken,
+    config.telegramChatId,
+    config.telegramLogsEnabled
+  );
 
   if (!config.geminiApiKey) {
     console.log(chalk.red("✗ GEMINI_API_KEY is required in your .env file"));
@@ -125,6 +131,12 @@ export async function simulateCommand(options: SimulateOptions): Promise<void> {
 
   const startTime = Date.now();
 
+  if (telegramNotifier.isEnabled()) {
+    telegramNotifier.send(
+      `🧪 Simulated job started\nID: ${fakeJob.id}\nType: ${fakeJob.jobType}\nBudget: $${budget.toFixed(2)}\nPrompt:\n${prompt}`
+    );
+  }
+
   try {
     const llm = getLLMClient();
     const result = await llm.generate({
@@ -179,6 +191,12 @@ export async function simulateCommand(options: SimulateOptions): Promise<void> {
       console.log(chalk.gray(`  Est. Cost:  `) + chalk.yellow(`$${usage.estimatedCost.toFixed(4)}`));
     }
 
+    if (telegramNotifier.isEnabled()) {
+      telegramNotifier.send(
+        `🧠 Simulated response generated\nID: ${fakeJob.id}\nResponse:\n${result.text}`
+      );
+    }
+
     // Response output
     console.log(chalk.cyan("\n" + "═".repeat(60)));
     console.log(chalk.cyan.bold("  Agent Response"));
@@ -198,6 +216,12 @@ export async function simulateCommand(options: SimulateOptions): Promise<void> {
           ? chalk.green(`+$${profitMargin.toFixed(4)}`)
           : chalk.red(`-$${Math.abs(profitMargin).toFixed(4)}`)) +
         chalk.gray(` (job pays $${budget.toFixed(2)}, LLM cost ~$${usage.estimatedCost.toFixed(4)})`)
+      );
+    }
+
+    if (telegramNotifier.isEnabled()) {
+      telegramNotifier.send(
+        `✅ Simulated job complete\nID: ${fakeJob.id}\nModel: ${config.model}${usage ? `\nCost: $${usage.estimatedCost.toFixed(4)}` : ""}`
       );
     }
 
@@ -222,6 +246,11 @@ export async function simulateCommand(options: SimulateOptions): Promise<void> {
     );
     if (error instanceof Error && error.stack) {
       console.error(chalk.gray(error.stack));
+    }
+    if (telegramNotifier.isEnabled()) {
+      telegramNotifier.send(
+        `❌ Simulated job failed\nID: ${fakeJob.id}\nError: ${error instanceof Error ? error.message : "Unknown error"}`
+      );
     }
     process.exit(1);
   }

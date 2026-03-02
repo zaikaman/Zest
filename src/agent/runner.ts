@@ -124,7 +124,7 @@ export class AgentRunner extends EventEmitter implements TypedEventEmitter {
 
     switch (event.type) {
       case "job_found":
-        message = `🆕 Job found\nID: ${event.job.id}\nBudget: $${event.job.budget.toFixed(2)}`;
+        message = `🆕 Job found\nID: ${event.job.id}\nBudget: $${event.job.budget.toFixed(2)}\nPrompt:\n${event.job.prompt}`;
         break;
       case "job_accepted":
         message = `✅ Swarm job accepted\nID: ${event.job.id}\nPer-agent budget: ${event.budgetPerAgent ?? "n/a"}`;
@@ -136,7 +136,7 @@ export class AgentRunner extends EventEmitter implements TypedEventEmitter {
         message = `⏭️ Job skipped\nID: ${event.job.id}\nReason: ${event.reason}`;
         break;
       case "response_generated":
-        message = `🧠 Response generated\nID: ${event.job.id}\nPreview: ${event.preview.substring(0, 180)}`;
+        message = `🧠 Response generated\nID: ${event.job.id}\nResponse:\n${event.preview}`;
         break;
       case "project_built":
         message = `📦 Project built\nID: ${event.job.id}\nFiles: ${event.files.length}`;
@@ -534,7 +534,7 @@ export class AgentRunner extends EventEmitter implements TypedEventEmitter {
       this.emitEvent({
         type: "response_generated",
         job,
-        preview: result.text.substring(0, 200),
+        preview: result.text,
         usage,
       });
 

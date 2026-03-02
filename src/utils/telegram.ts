@@ -1,5 +1,7 @@
 import fetch from "node-fetch";
 
+const TELEGRAM_MAX_MESSAGE_LENGTH = 4000;
+
 export class TelegramNotifier {
   private readonly enabled: boolean;
   private readonly token: string;
@@ -20,10 +22,37 @@ export class TelegramNotifier {
     if (!this.enabled || !text.trim()) return;
 
     this.queue = this.queue
-      .then(() => this.sendMessage(text))
-      .catch(() => {
-        return;
+      .then(() => this.sendAll(text))
+      .catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`[Telegram] ${message}`);
       });
+  }
+
+  private splitMessage(text: string): string[] {
+    if (text.length <= TELEGRAM_MAX_MESSAGE_LENGTH) {
+      return [text];
+    }
+
+    const chunks: string[] = [];
+    let start = 0;
+
+    while (start < text.length) {
+      const end = Math.min(start + TELEGRAM_MAX_MESSAGE_LENGTH, text.length);
+      chunks.push(text.slice(start, end));
+      start = end;
+    }
+
+    return chunks;
+  }
+
+  private async sendAll(text: string): Promise<void> {
+    const chunks = this.splitMessage(text);
+
+    for (let i = 0; i < chunks.length; i++) {
+      const prefix = chunks.length > 1 ? `[${i + 1}/${chunks.length}]\n` : "";
+      await this.sendMessage(`${prefix}${chunks[i]}`);
+    }
   }
 
   private async sendMessage(text: string): Promise<void> {
@@ -42,7 +71,8 @@ export class TelegramNotifier {
     });
 
     if (!response.ok) {
-      throw new Error(`Telegram send failed with HTTP ${response.status}`);
+      const body = await response.text();
+      throw new Error(`Telegram send failed with HTTP ${response.status}: ${body}`);
     }
   }
 }

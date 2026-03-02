@@ -106,7 +106,7 @@ async function main() {
           logger.job("Skipped", event.job.id, event.reason);
           break;
         case "response_generated":
-          logger.job("Generated", event.job.id, event.preview.substring(0, 50) + "...");
+          logger.job("Generated", event.job.id, event.preview);
           break;
         case "response_submitted":
           logger.success(`Response submitted: ${event.responseId}`);

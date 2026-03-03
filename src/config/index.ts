@@ -85,7 +85,6 @@ export function getConfig(): AgentConfig {
     telegramChatId: process.env.TELEGRAM_CHAT_ID || "",
     telegramPromptCommandEnabled: process.env.TELEGRAM_PROMPT_COMMAND_ENABLED === "true",
     telegramCommandPollIntervalSec: parseInt(process.env.TELEGRAM_COMMAND_POLL_INTERVAL_SEC || "5", 10),
-    telegramCommandLongPollTimeoutSec: parseInt(process.env.TELEGRAM_COMMAND_LONG_POLL_TIMEOUT_SEC || "50", 10),
 
     // LLM retry settings (for recovering from transient tool argument parsing errors)
     llmRetryMaxAttempts: parseInt(process.env.LLM_RETRY_MAX_ATTEMPTS || "100", 10),

@@ -61,7 +61,7 @@ export class AgentRunner extends EventEmitter implements TypedEventEmitter {
   private pusher: PusherClient | null = null;
   private wsConnected = false;
   private telegramNotifier: TelegramNotifier;
-  private telegramCommandLoopActive = false;
+  private telegramCommandTimer: NodeJS.Timeout | null = null;
   private telegramCommandOffset = 0;
   private processingTelegramPrompt = false;
   private stats = {
@@ -200,29 +200,29 @@ export class AgentRunner extends EventEmitter implements TypedEventEmitter {
       return;
     }
 
-    this.telegramCommandLoopActive = true;
-    void this.runTelegramCommandLoop();
+    const intervalMs = Math.max(2, config.telegramCommandPollIntervalSec) * 1000;
 
-    logger.info(
-      `Telegram /prompt command long-poll enabled (timeout ${Math.max(10, Math.min(config.telegramCommandLongPollTimeoutSec, 50))}s)`
-    );
+    const tick = async () => {
+      if (!this.running) return;
+      await this.pollTelegramCommands();
+      if (this.running) {
+        this.telegramCommandTimer = setTimeout(() => {
+          void tick();
+        }, intervalMs);
+      }
+    };
+
+    this.telegramCommandTimer = setTimeout(() => {
+      void tick();
+    }, intervalMs);
+
+    logger.info(`Telegram /prompt command polling enabled (interval ${intervalMs / 1000}s)`);
   }
 
   private stopTelegramCommandPolling(): void {
-    this.telegramCommandLoopActive = false;
-  }
-
-  private async runTelegramCommandLoop(): Promise<void> {
-    const config = getConfig();
-    const errorBackoffMs = Math.max(2, config.telegramCommandPollIntervalSec) * 1000;
-
-    while (this.running && this.telegramCommandLoopActive) {
-      try {
-        await this.pollTelegramCommands();
-      } catch (error) {
-        logger.warn(`Telegram command loop error: ${error instanceof Error ? error.message : String(error)}`);
-        await new Promise((resolve) => setTimeout(resolve, errorBackoffMs));
-      }
+    if (this.telegramCommandTimer) {
+      clearTimeout(this.telegramCommandTimer);
+      this.telegramCommandTimer = null;
     }
   }
 
@@ -237,8 +237,7 @@ export class AgentRunner extends EventEmitter implements TypedEventEmitter {
     }
 
     try {
-      const longPollTimeout = Math.max(10, Math.min(config.telegramCommandLongPollTimeoutSec, 50));
-      const updates = await this.telegramNotifier.getUpdates(this.telegramCommandOffset, longPollTimeout);
+      const updates = await this.telegramNotifier.getUpdates(this.telegramCommandOffset, 0);
       if (updates.length === 0) {
         return;
       }

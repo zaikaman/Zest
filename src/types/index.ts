@@ -204,7 +204,6 @@ export interface AgentConfig {
   telegramChatId: string;
   telegramPromptCommandEnabled: boolean;
   telegramCommandPollIntervalSec: number;
-  telegramCommandLongPollTimeoutSec: number;
 
   // LLM retry settings (for recovering from transient tool argument parsing errors)
   llmRetryMaxAttempts: number;

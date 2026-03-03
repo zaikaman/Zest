@@ -27,10 +27,14 @@ const RETRYABLE_ERROR_PATTERNS = [
 function getRetryConfig() {
   const config = getConfig();
   return {
-    maxRetries: config.llmRetryMaxAttempts,
+    maxRetries: Math.min(config.llmRetryMaxAttempts, 50),
     baseDelayMs: config.llmRetryBaseDelayMs,
     maxDelayMs: config.llmRetryMaxDelayMs,
     fallbackNoTools: config.llmRetryFallbackNoTools,
+    maxToolSteps: config.llmMaxToolSteps,
+    maxToolCalls: config.llmMaxToolCalls,
+    maxGenerationMs: config.llmMaxGenerationMs,
+    global429CooldownMs: config.llmGlobal429CooldownMs,
   };
 }
 
@@ -107,6 +111,24 @@ function getRetryDelay(
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+let globalGeminiCooldownUntil = 0;
+
+async function waitForGlobalGeminiCooldown(): Promise<void> {
+  const waitMs = globalGeminiCooldownUntil - Date.now();
+  if (waitMs > 0) {
+    logger.warn(`Global Gemini cooldown active; waiting ${waitMs}ms before next request`);
+    await sleep(waitMs);
+  }
+}
+
+function setGlobalGeminiCooldown(ms: number): void {
+  if (ms <= 0) return;
+  const next = Date.now() + ms;
+  if (next > globalGeminiCooldownUntil) {
+    globalGeminiCooldownUntil = next;
+  }
 }
 
 export interface GenerateOptions {
@@ -316,6 +338,46 @@ function compactContentsForGateway(
 }
 
 function compactToolResultForModel(toolName: string, toolResult: unknown): Record<string, unknown> {
+  if (toolName === "list_files" && isPlainObject(toolResult)) {
+    const files = Array.isArray(toolResult.files) ? toolResult.files : [];
+    return {
+      success: toolResult.success,
+      totalFiles: toolResult.totalFiles,
+      files: files.slice(0, 300),
+      hasMore: files.length > 300,
+    };
+  }
+
+  if (toolName === "search_files" && isPlainObject(toolResult)) {
+    const matches = Array.isArray(toolResult.matches) ? toolResult.matches : [];
+    return {
+      success: toolResult.success,
+      totalMatches: toolResult.totalMatches,
+      matches: matches.slice(0, 120),
+      hasMore: matches.length > 120,
+    };
+  }
+
+  if (toolName === "read_file" && isPlainObject(toolResult)) {
+    const content = typeof toolResult.content === "string" ? toolResult.content : "";
+    return {
+      success: toolResult.success,
+      path: toolResult.path,
+      size: toolResult.size,
+      content: truncateText(content, 5000),
+    };
+  }
+
+  if (toolName === "edit_file" && isPlainObject(toolResult)) {
+    return {
+      success: toolResult.success,
+      path: toolResult.path,
+      replacements: toolResult.replacements,
+      size: toolResult.size,
+      totalFiles: toolResult.totalFiles,
+    };
+  }
+
   if (toolName === "create_file" && isPlainObject(toolResult)) {
     return {
       success: toolResult.success,
@@ -369,6 +431,128 @@ function compactToolResultForModel(toolName: string, toolResult: unknown): Recor
   }
 
   return { result: toolResult };
+}
+
+function getLatestFunctionResponseParts(
+  contents: Array<{
+    role: "user" | "model";
+    parts: Array<
+      | { text: string }
+      | { functionCall: { name: string; args: Record<string, unknown> } }
+      | { functionResponse: { name: string; response: Record<string, unknown> } }
+    >;
+  }>
+): Array<{ functionResponse: { name: string; response: Record<string, unknown> } }> {
+  for (let i = contents.length - 1; i >= 0; i--) {
+    const message = contents[i];
+    if (message.role !== "user") continue;
+
+    const functionResponses = message.parts.filter(
+      (part): part is { functionResponse: { name: string; response: Record<string, unknown> } } =>
+        "functionResponse" in part
+    );
+
+    if (functionResponses.length > 0) {
+      return functionResponses;
+    }
+  }
+
+  return [];
+}
+
+function buildWorkingMemorySummary(params: {
+  allToolCalls: NonNullable<LLMResponse["toolCalls"]>;
+  finalText: string;
+  hasProjectBuilder: boolean;
+  fileList: string[];
+}): string {
+  const { allToolCalls, finalText, hasProjectBuilder, fileList } = params;
+  const recentCalls = allToolCalls.slice(-24);
+
+  const recentLines = recentCalls.map((toolCall, index) => {
+    const result = toolCall.result as { success?: boolean; error?: string } | undefined;
+    const status = result?.success === true ? "success" : result?.error ? `error=${String(result.error)}` : "done";
+    return `${index + 1}. ${toolCall.name} (${status})`;
+  });
+
+  const filesSummary = hasProjectBuilder
+    ? fileList.slice(0, 80).join(", ") || "(none yet)"
+    : "(project builder not initialized)";
+
+  const sections = [
+    "State summary for continuation:",
+    `- Total tool calls so far: ${allToolCalls.length}`,
+    `- Recent tool calls:\n${recentLines.length ? recentLines.join("\n") : "(none)"}`,
+    `- Current files: ${filesSummary}`,
+    finalText ? `- Latest assistant draft text:\n${truncateText(finalText, 2200)}` : "- Latest assistant draft text: (none)",
+    "Continue from this state and avoid repeating unchanged file rewrites.",
+  ];
+
+  return truncateText(sections.join("\n\n"), 7000);
+}
+
+function rebuildToolLoopContents(params: {
+  prompt: string;
+  contents: Array<{
+    role: "user" | "model";
+    parts: Array<
+      | { text: string }
+      | { functionCall: { name: string; args: Record<string, unknown> } }
+      | { functionResponse: { name: string; response: Record<string, unknown> } }
+    >;
+  }>;
+  allToolCalls: NonNullable<LLMResponse["toolCalls"]>;
+  finalText: string;
+  projectFiles: string[];
+}): Array<{
+  role: "user" | "model";
+  parts: Array<
+    | { text: string }
+    | { functionCall: { name: string; args: Record<string, unknown> } }
+    | { functionResponse: { name: string; response: Record<string, unknown> } }
+  >;
+}> {
+  const { prompt, contents, allToolCalls, finalText, projectFiles } = params;
+  const latestFunctionResponses = getLatestFunctionResponseParts(contents).map((part) => ({
+    functionResponse: {
+      name: part.functionResponse.name,
+      response: pruneForGateway(part.functionResponse.response) as Record<string, unknown>,
+    },
+  }));
+
+  const summaryText = buildWorkingMemorySummary({
+    allToolCalls,
+    finalText,
+    hasProjectBuilder: projectFiles.length >= 0,
+    fileList: projectFiles,
+  });
+
+  const rebuilt: Array<{
+    role: "user" | "model";
+    parts: Array<
+      | { text: string }
+      | { functionCall: { name: string; args: Record<string, unknown> } }
+      | { functionResponse: { name: string; response: Record<string, unknown> } }
+    >;
+  }> = [
+    {
+      role: "user",
+      parts: [{ text: truncateText(prompt, 5000) }],
+    },
+    {
+      role: "model",
+      parts: [{ text: summaryText }],
+    },
+  ];
+
+  if (latestFunctionResponses.length > 0) {
+    rebuilt.push({
+      role: "user",
+      parts: latestFunctionResponses,
+    });
+  }
+
+  return rebuilt;
 }
 
 export class LLMClient {
@@ -521,7 +705,39 @@ export class LLMClient {
 
       const createFileSchema = z.object({
         path: z.string().describe("The file path relative to the project root"),
-        content: z.string().describe("The complete content of the file"),
+        content: z.string().optional().describe("The complete content of the file"),
+        contents: z.string().optional().describe("Alias of content; accepted for model compatibility"),
+      });
+
+      const readFileSchema = z.object({
+        path: z.string().describe("The file path relative to the project root"),
+      });
+
+      const listFilesSchema = z.object({
+        pathContains: z
+          .string()
+          .optional()
+          .describe("Optional substring filter for file paths, e.g. 'src/' or '.tsx'"),
+      });
+
+      const searchFilesSchema = z.object({
+        query: z.string().describe("Text or regex pattern to search for"),
+        isRegex: z.boolean().optional().describe("Whether query is a regex pattern"),
+        pathContains: z
+          .string()
+          .optional()
+          .describe("Optional substring filter for file paths"),
+        maxResults: z.number().int().positive().max(500).optional().describe("Maximum number of matches"),
+      });
+
+      const editFileSchema = z.object({
+        path: z.string().describe("The file path relative to the project root"),
+        search: z.string().describe("Exact text to find in the target file"),
+        replace: z.string().describe("Replacement text"),
+        allOccurrences: z
+          .boolean()
+          .optional()
+          .describe("When true, replace all occurrences; otherwise replace first match only"),
       });
 
       tools.create_file = {
@@ -543,13 +759,18 @@ export class LLMClient {
                 type: "STRING",
                 description: "Full file content",
               },
+              contents: {
+                type: "STRING",
+                description: "Alias of content",
+              },
             },
-            required: ["path", "content"],
+            required: ["path"],
           },
         },
         execute: async (args: Record<string, unknown>) => {
           const path = String(args.path || "");
-          const content = String(args.content || "");
+          const rawContent = args.content ?? args.contents ?? "";
+          const content = String(rawContent || "");
           logger.tool("create_file", "start", `Creating: ${path}`);
           try {
             if (!activeProjectBuilder) {
@@ -572,6 +793,185 @@ export class LLMClient {
             logger.tool("create_file", "error", String(error));
             throw error;
           }
+        },
+      };
+
+      tools.read_file = {
+        description:
+          "Read an existing file in the current generated project. Use this before editing to avoid rewriting the entire file.",
+        schema: readFileSchema,
+        declaration: {
+          name: "read_file",
+          description: "Read and return the full contents of a generated project file.",
+          parameters: {
+            type: "OBJECT",
+            properties: {
+              path: {
+                type: "STRING",
+                description: "Path relative to project root",
+              },
+            },
+            required: ["path"],
+          },
+        },
+        execute: async (args: Record<string, unknown>) => {
+          const path = String(args.path || "");
+          logger.tool("read_file", "start", `Reading: ${path}`);
+          if (!activeProjectBuilder) {
+            throw new Error("No files have been created. Use create_file first.");
+          }
+
+          const content = activeProjectBuilder.readFile(path);
+          logger.tool("read_file", "success", `Read ${path} (${content.length} bytes)`);
+          return {
+            success: true,
+            path,
+            size: content.length,
+            content,
+          };
+        },
+      };
+
+      tools.list_files = {
+        description:
+          "List all current files in the generated project, optionally filtered by path substring.",
+        schema: listFilesSchema,
+        declaration: {
+          name: "list_files",
+          description: "List files in the current generated project.",
+          parameters: {
+            type: "OBJECT",
+            properties: {
+              pathContains: {
+                type: "STRING",
+                description: "Optional path substring filter",
+              },
+            },
+          },
+        },
+        execute: async (args: Record<string, unknown>) => {
+          const pathContains = typeof args.pathContains === "string" ? args.pathContains : undefined;
+          logger.tool("list_files", "start", pathContains ? `Filter: ${pathContains}` : "Listing all files");
+
+          if (!activeProjectBuilder) {
+            throw new Error("No files have been created. Use create_file first.");
+          }
+
+          const files = activeProjectBuilder.listFiles(pathContains);
+          logger.tool("list_files", "success", `Found ${files.length} files`);
+          return {
+            success: true,
+            totalFiles: files.length,
+            files,
+          };
+        },
+      };
+
+      tools.search_files = {
+        description:
+          "Search text across generated project files. Supports plain text and regex. Use this before edit_file to target exact locations.",
+        schema: searchFilesSchema,
+        declaration: {
+          name: "search_files",
+          description: "Search text in generated project files and return line-level matches.",
+          parameters: {
+            type: "OBJECT",
+            properties: {
+              query: {
+                type: "STRING",
+                description: "Text or regex pattern to search for",
+              },
+              isRegex: {
+                type: "BOOLEAN",
+                description: "Whether query is regex",
+              },
+              pathContains: {
+                type: "STRING",
+                description: "Optional file path filter",
+              },
+              maxResults: {
+                type: "NUMBER",
+                description: "Maximum number of matches",
+              },
+            },
+            required: ["query"],
+          },
+        },
+        execute: async (args: Record<string, unknown>) => {
+          const query = String(args.query || "");
+          const isRegex = Boolean(args.isRegex);
+          const pathContains = typeof args.pathContains === "string" ? args.pathContains : undefined;
+          const maxResults = typeof args.maxResults === "number" ? args.maxResults : undefined;
+
+          logger.tool("search_files", "start", `Query: ${query}`);
+          if (!activeProjectBuilder) {
+            throw new Error("No files have been created. Use create_file first.");
+          }
+
+          const matches = activeProjectBuilder.searchText(query, {
+            isRegex,
+            pathContains,
+            maxResults,
+          });
+
+          logger.tool("search_files", "success", `Found ${matches.length} matches`);
+          return {
+            success: true,
+            totalMatches: matches.length,
+            matches,
+          };
+        },
+      };
+
+      tools.edit_file = {
+        description:
+          "Edit an existing file using precise search/replace without rewriting unrelated parts of the file.",
+        schema: editFileSchema,
+        declaration: {
+          name: "edit_file",
+          description: "Edit a generated file by replacing text patterns.",
+          parameters: {
+            type: "OBJECT",
+            properties: {
+              path: {
+                type: "STRING",
+                description: "Path relative to project root",
+              },
+              search: {
+                type: "STRING",
+                description: "Exact text to find",
+              },
+              replace: {
+                type: "STRING",
+                description: "Replacement text",
+              },
+              allOccurrences: {
+                type: "BOOLEAN",
+                description: "Replace all matches when true",
+              },
+            },
+            required: ["path", "search", "replace"],
+          },
+        },
+        execute: async (args: Record<string, unknown>) => {
+          const path = String(args.path || "");
+          const search = String(args.search || "");
+          const replace = String(args.replace || "");
+          const allOccurrences = Boolean(args.allOccurrences);
+
+          logger.tool("edit_file", "start", `Editing: ${path}`);
+          if (!activeProjectBuilder) {
+            throw new Error("No files have been created. Use create_file first.");
+          }
+
+          const result = activeProjectBuilder.editFile(path, search, replace, {
+            allOccurrences,
+          });
+          logger.tool("edit_file", "success", `Edited ${path}, replacements: ${result.replacements}`);
+          return {
+            success: true,
+            ...result,
+          };
         },
       };
 
@@ -699,6 +1099,7 @@ export class LLMClient {
     let lastError: unknown;
     let attempt = 0;
     const retryConfig = getRetryConfig();
+    const generationStartedAt = Date.now();
     let resumeState: GenerationResumeState | undefined;
 
     while (attempt <= retryConfig.maxRetries) {
@@ -720,13 +1121,19 @@ export class LLMClient {
           const rootCause = error.cause;
           const apiError = rootCause instanceof GeminiApiError ? rootCause : null;
           if (apiError && (apiError.status === 429 || apiError.status >= 500)) {
-            const compactedContents = compactContentsForGateway(resumeState.contents, 1);
-            if (compactedContents.length <= resumeState.contents.length) {
-              resumeState.contents = compactedContents;
-              logger.warn(
-                `Applied aggressive resume-state compaction after ${apiError.status} to improve retry compatibility (messageBlocks=${resumeState.contents.length})`
-              );
-            }
+            const builder = getActiveBuilder();
+            const rebuiltContents = rebuildToolLoopContents({
+              prompt,
+              contents: resumeState.contents,
+              allToolCalls: resumeState.allToolCalls,
+              finalText: resumeState.finalText,
+              projectFiles: builder?.getFiles() || [],
+            });
+            const rebuiltBytes = JSON.stringify(rebuiltContents).length;
+            resumeState.contents = rebuiltContents;
+            logger.warn(
+              `Rebuilt resume-state context after ${apiError.status} to compact working memory (messageBlocks=${resumeState.contents.length}, payloadBytes=${rebuiltBytes})`
+            );
           }
 
           logger.debug(
@@ -735,7 +1142,17 @@ export class LLMClient {
         }
 
         if (isRetryableError(error) && attempt < retryConfig.maxRetries) {
+          if (Date.now() - generationStartedAt >= retryConfig.maxGenerationMs) {
+            throw new Error(
+              `LLM generation exceeded max duration (${retryConfig.maxGenerationMs}ms); aborting job to avoid retry storm`
+            );
+          }
+
           const delay = getRetryDelay(attempt, retryConfig, error);
+          const rootCause = error instanceof GenerationInterruptedError ? error.cause : error;
+          if (rootCause instanceof GeminiApiError && rootCause.status === 429) {
+            setGlobalGeminiCooldown(Math.max(delay, retryConfig.global429CooldownMs));
+          }
           const reason = getErrorMessage(error);
           logger.warn(
             `LLM generation failed with retryable error (attempt ${attempt + 1}/${retryConfig.maxRetries + 1}), retrying in ${delay}ms: ${reason.substring(0, 240)}`
@@ -777,6 +1194,8 @@ export class LLMClient {
   private async invokeGemini(payload: Record<string, unknown>): Promise<GeminiResponse> {
     const base = this.apiBaseUrl.replace(/\/$/, "");
     const endpoint = `${base}/models/${this.model}:generateContent?key=${encodeURIComponent(this.apiKey)}`;
+
+    await waitForGlobalGeminiCooldown();
 
     logger.debug(
       `Gemini request -> model=${this.model}, endpoint=${base}/models/{model}:generateContent, payloadBytes=${JSON.stringify(payload).length}`
@@ -835,6 +1254,7 @@ export class LLMClient {
   }): Promise<LLMResponse> {
     const { prompt, systemPrompt, maxTokens, temperature, tools, resumeState } = params;
     const hasTools = !!tools && Object.keys(tools).length > 0;
+    const retryConfig = getRetryConfig();
 
     let contents: Array<{
       role: "user" | "model";
@@ -855,7 +1275,7 @@ export class LLMClient {
     let finalText = resumeState?.finalText || "";
     let consecutiveNonProgressTurns = resumeState?.consecutiveNonProgressTurns || 0;
 
-    const maxSteps = hasTools ? Infinity : 1;
+    const maxSteps = hasTools ? Math.max(1, retryConfig.maxToolSteps) : 1;
     let stepsCompleted = resumeState?.stepsCompleted || 0;
     let previousToolCycleSignature = "";
     let repeatedToolCycleCount = 0;
@@ -895,6 +1315,31 @@ export class LLMClient {
       }
 
       let payloadBytes = JSON.stringify(payload).length;
+      if (hasTools && (contents.length > 4 || allToolCalls.length > Math.floor(retryConfig.maxToolCalls * 0.5))) {
+        const builder = getActiveBuilder();
+        const rebuiltContents = rebuildToolLoopContents({
+          prompt,
+          contents,
+          allToolCalls,
+          finalText,
+          projectFiles: builder?.getFiles() || [],
+        });
+        const rebuiltPayload: Record<string, unknown> = {
+          ...payload,
+          contents: rebuiltContents,
+        };
+        const rebuiltBytes = JSON.stringify(rebuiltPayload).length;
+
+        if (rebuiltBytes < payloadBytes) {
+          logger.warn(
+            `Rebuilt tool-loop context at step ${step + 1} from ${payloadBytes} bytes to ${rebuiltBytes} bytes using working memory`
+          );
+          contents = rebuiltContents;
+          payload = rebuiltPayload;
+          payloadBytes = rebuiltBytes;
+        }
+      }
+
       if (hasTools && payloadBytes > MAX_GATEWAY_PAYLOAD_BYTES) {
         const compactedContents = compactContentsForGateway(contents);
         const compactedPayload: Record<string, unknown> = {
@@ -1069,6 +1514,13 @@ export class LLMClient {
           result: toolResult,
         });
 
+        if (hasTools && allToolCalls.length >= retryConfig.maxToolCalls) {
+          logger.warn(
+            `Reached max tool call limit (${retryConfig.maxToolCalls}); stopping tool loop to prevent runaway generation`
+          );
+          break;
+        }
+
         logger.debug(
           `Tool result recorded for ${functionCall.name}: ${JSON.stringify(toolResult).substring(0, 220)}`
         );
@@ -1096,6 +1548,10 @@ export class LLMClient {
       });
 
       stepsCompleted = step + 1;
+
+      if (hasTools && allToolCalls.length >= retryConfig.maxToolCalls) {
+        break;
+      }
 
       if (finalizedProjectThisStep) {
         logger.info("Project finalized successfully; stopping tool loop early");

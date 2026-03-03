@@ -208,6 +208,10 @@ export interface AgentConfig {
   llmRetryBaseDelayMs: number;
   llmRetryMaxDelayMs: number;
   llmRetryFallbackNoTools: boolean;
+  llmMaxToolSteps: number;
+  llmMaxToolCalls: number;
+  llmMaxGenerationMs: number;
+  llmGlobal429CooldownMs: number;
 }
 
 export interface StoredConfig {

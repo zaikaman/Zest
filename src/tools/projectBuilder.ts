@@ -39,6 +39,7 @@ export interface ProjectBuildValidationResult {
 export class ProjectBuilder {
   private projectDir: string;
   private files: Map<string, string> = new Map();
+  private lastInstalledPackageJson: string | null = null;
 
   constructor(projectName?: string) {
     const name = projectName || `project-${randomUUID().slice(0, 8)}`;
@@ -113,6 +114,137 @@ export class ProjectBuilder {
   }
 
   /**
+   * List project files with optional substring path filter
+   */
+  listFiles(pathContains?: string): string[] {
+    const files = this.getFiles().sort((a, b) => a.localeCompare(b));
+    if (!pathContains) {
+      return files;
+    }
+    const needle = pathContains.toLowerCase();
+    return files.filter((filePath) => filePath.toLowerCase().includes(needle));
+  }
+
+  /**
+   * Read a file's current content from the in-memory project map
+   */
+  readFile(relativePath: string): string {
+    const normalizedPath = relativePath.replace(/\\/g, "/");
+    const existing = this.files.get(normalizedPath);
+    if (existing === undefined) {
+      throw new Error(`File not found: ${normalizedPath}`);
+    }
+    return existing;
+  }
+
+  /**
+   * Edit an existing file using search/replace semantics
+   */
+  editFile(
+    relativePath: string,
+    search: string,
+    replace: string,
+    options?: { allOccurrences?: boolean }
+  ): {
+    path: string;
+    replacements: number;
+    size: number;
+    totalFiles: number;
+  } {
+    const normalizedPath = relativePath.replace(/\\/g, "/");
+    const content = this.readFile(normalizedPath);
+
+    if (search.length === 0) {
+      throw new Error("Search string cannot be empty");
+    }
+
+    const replaceAll = options?.allOccurrences ?? false;
+    let replacements = 0;
+    let updated = content;
+
+    if (replaceAll) {
+      const parts = content.split(search);
+      replacements = parts.length - 1;
+      if (replacements === 0) {
+        throw new Error(`Search text not found in ${normalizedPath}`);
+      }
+      updated = parts.join(replace);
+    } else {
+      const index = content.indexOf(search);
+      if (index === -1) {
+        throw new Error(`Search text not found in ${normalizedPath}`);
+      }
+      replacements = 1;
+      updated = `${content.slice(0, index)}${replace}${content.slice(index + search.length)}`;
+    }
+
+    this.addFile(normalizedPath, updated);
+
+    return {
+      path: normalizedPath,
+      replacements,
+      size: updated.length,
+      totalFiles: this.files.size,
+    };
+  }
+
+  /**
+   * Search text in generated project files
+   */
+  searchText(query: string, options?: { isRegex?: boolean; pathContains?: string; maxResults?: number }): Array<{
+    path: string;
+    line: number;
+    column: number;
+    text: string;
+  }> {
+    const maxResults = Math.max(1, options?.maxResults ?? 200);
+    const files = this.listFiles(options?.pathContains);
+    const results: Array<{ path: string; line: number; column: number; text: string }> = [];
+
+    if (!query) {
+      return results;
+    }
+
+    let regex: RegExp | null = null;
+    if (options?.isRegex) {
+      regex = new RegExp(query, "i");
+    }
+
+    for (const path of files) {
+      const content = this.readFile(path);
+      const lines = content.split(/\r?\n/);
+
+      for (let index = 0; index < lines.length; index++) {
+        const lineText = lines[index];
+        let matchIndex = -1;
+
+        if (regex) {
+          const match = lineText.match(regex);
+          if (match && typeof match.index === "number") {
+            matchIndex = match.index;
+          }
+        } else {
+          matchIndex = lineText.toLowerCase().indexOf(query.toLowerCase());
+        }
+
+        if (matchIndex >= 0) {
+          results.push({
+            path,
+            line: index + 1,
+            column: matchIndex + 1,
+            text: lineText,
+          });
+          if (results.length >= maxResults) {
+            return results;
+          }
+        }
+      }
+    }
+
+    return results;
+  }
+
+  /**
    * Get the project directory path
    */
   getProjectDir(): string {
@@ -171,8 +303,10 @@ ${fileList || "- (project files generated during build)"}
     }
 
     let buildScriptDetected = false;
+    let packageJsonRaw = "";
     try {
-      const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf-8")) as {
+      packageJsonRaw = readFileSync(packageJsonPath, "utf-8");
+      const packageJson = JSON.parse(packageJsonRaw) as {
         scripts?: Record<string, string>;
       };
       buildScriptDetected = !!packageJson.scripts?.build;
@@ -198,7 +332,8 @@ ${fileList || "- (project files generated during build)"}
 
     const nodeModulesPath = join(this.projectDir, "node_modules");
     let installRan = false;
-    if (!existsSync(nodeModulesPath)) {
+    const shouldInstall = !existsSync(nodeModulesPath) || this.lastInstalledPackageJson !== packageJsonRaw;
+    if (shouldInstall) {
       installRan = true;
       const installResult = await this.runCommand(
         "npm",
@@ -214,9 +349,25 @@ ${fileList || "- (project files generated during build)"}
           buildScriptDetected,
         };
       }
+      this.lastInstalledPackageJson = packageJsonRaw;
     }
 
-    const buildResult = await this.runCommand("npm", ["run", "build"], 240000);
+    let buildResult = await this.runCommand("npm", ["run", "build"], 240000);
+
+    const missingToolBinary = /tsc:\s*not\s*found|vite:\s*not\s*found|next:\s*not\s*found|react-scripts:\s*not\s*found/i.test(buildResult.output);
+    if (!buildResult.success && !installRan && missingToolBinary) {
+      installRan = true;
+      const installRetry = await this.runCommand(
+        "npm",
+        ["install", "--include=dev", "--no-audit", "--no-fund"],
+        240000
+      );
+      if (installRetry.success) {
+        this.lastInstalledPackageJson = packageJsonRaw;
+        buildResult = await this.runCommand("npm", ["run", "build"], 240000);
+      }
+    }
+
     return {
       success: buildResult.success,
       projectDir: this.projectDir,

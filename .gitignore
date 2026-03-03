@@ -36,5 +36,5 @@ temp/
 .seed-agent/
 # plandex
 generated-projects
-cline
+# cline
 seed-skill

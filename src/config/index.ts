@@ -85,6 +85,10 @@ export function getConfig(): AgentConfig {
     llmRetryBaseDelayMs: parseInt(process.env.LLM_RETRY_BASE_DELAY_MS || "2000", 10),
     llmRetryMaxDelayMs: parseInt(process.env.LLM_RETRY_MAX_DELAY_MS || "30000", 10),
     llmRetryFallbackNoTools: process.env.LLM_RETRY_FALLBACK_NO_TOOLS !== "false",
+    llmMaxToolSteps: parseInt(process.env.LLM_MAX_TOOL_STEPS || "14", 10),
+    llmMaxToolCalls: parseInt(process.env.LLM_MAX_TOOL_CALLS || "120", 10),
+    llmMaxGenerationMs: parseInt(process.env.LLM_MAX_GENERATION_MS || "600000", 10),
+    llmGlobal429CooldownMs: parseInt(process.env.LLM_GLOBAL_429_COOLDOWN_MS || "10000", 10),
   };
 }
 

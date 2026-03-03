@@ -61,6 +61,9 @@ export class AgentRunner extends EventEmitter implements TypedEventEmitter {
   private pusher: PusherClient | null = null;
   private wsConnected = false;
   private telegramNotifier: TelegramNotifier;
+  private telegramCommandLoopActive = false;
+  private telegramCommandOffset = 0;
+  private processingTelegramPrompt = false;
   private stats = {
     jobsProcessed: 0,
     jobsSkipped: 0,
@@ -161,6 +164,203 @@ export class AgentRunner extends EventEmitter implements TypedEventEmitter {
 
     if (message) {
       this.telegramNotifier.send(message);
+    }
+  }
+
+  private parsePromptCommand(text: string): string | null {
+    const match = text.match(/^\/prompt(?:@\w+)?\s+([\s\S]+)$/i);
+    if (!match) {
+      return null;
+    }
+
+    const prompt = match[1].trim();
+    return prompt.length > 0 ? prompt : null;
+  }
+
+  private async bootstrapTelegramCommandOffset(): Promise<void> {
+    try {
+      const updates = await this.telegramNotifier.getUpdates(undefined, 0);
+      if (updates.length > 0) {
+        const latest = updates[updates.length - 1];
+        this.telegramCommandOffset = latest.update_id + 1;
+      }
+    } catch (error) {
+      logger.warn(`Failed to bootstrap Telegram command offset: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  private startTelegramCommandPolling(): void {
+    const config = getConfig();
+
+    if (!this.telegramNotifier.isEnabled()) {
+      return;
+    }
+
+    if (!config.telegramPromptCommandEnabled) {
+      return;
+    }
+
+    this.telegramCommandLoopActive = true;
+    void this.runTelegramCommandLoop();
+
+    logger.info(
+      `Telegram /prompt command long-poll enabled (timeout ${Math.max(10, Math.min(config.telegramCommandLongPollTimeoutSec, 50))}s)`
+    );
+  }
+
+  private stopTelegramCommandPolling(): void {
+    this.telegramCommandLoopActive = false;
+  }
+
+  private async runTelegramCommandLoop(): Promise<void> {
+    const config = getConfig();
+    const errorBackoffMs = Math.max(2, config.telegramCommandPollIntervalSec) * 1000;
+
+    while (this.running && this.telegramCommandLoopActive) {
+      try {
+        await this.pollTelegramCommands();
+      } catch (error) {
+        logger.warn(`Telegram command loop error: ${error instanceof Error ? error.message : String(error)}`);
+        await new Promise((resolve) => setTimeout(resolve, errorBackoffMs));
+      }
+    }
+  }
+
+  private async pollTelegramCommands(): Promise<void> {
+    if (!this.running || !this.telegramNotifier.isEnabled()) {
+      return;
+    }
+
+    const config = getConfig();
+    if (!config.telegramPromptCommandEnabled) {
+      return;
+    }
+
+    try {
+      const longPollTimeout = Math.max(10, Math.min(config.telegramCommandLongPollTimeoutSec, 50));
+      const updates = await this.telegramNotifier.getUpdates(this.telegramCommandOffset, longPollTimeout);
+      if (updates.length === 0) {
+        return;
+      }
+
+      for (const update of updates) {
+        this.telegramCommandOffset = Math.max(this.telegramCommandOffset, update.update_id + 1);
+
+        const message = update.message;
+        if (!message || typeof message.text !== "string") {
+          continue;
+        }
+
+        if (String(message.chat.id) !== this.telegramNotifier.getChatId()) {
+          continue;
+        }
+
+        const promptText = this.parsePromptCommand(message.text);
+        if (!promptText) {
+          continue;
+        }
+
+        if (this.processingTelegramPrompt) {
+          this.telegramNotifier.send("⏳ A /prompt job is already running. Please wait for it to finish.");
+          continue;
+        }
+
+        await this.processTelegramPrompt(promptText, message.from?.username || message.from?.first_name);
+      }
+    } catch (error) {
+      logger.warn(`Telegram command polling failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  private async processTelegramPrompt(prompt: string, requestedBy?: string): Promise<void> {
+    this.processingTelegramPrompt = true;
+
+    const syntheticJobId = `tg_${Date.now()}`;
+    const config = getConfig();
+    const syntheticBudget = Math.max(config.minBudget, 5);
+    const syntheticJob: Job = {
+      id: syntheticJobId,
+      prompt,
+      budget: syntheticBudget,
+      status: "OPEN",
+      expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+      createdAt: new Date().toISOString(),
+      responseCount: 0,
+      routerVersion: 2,
+      jobType: "STANDARD",
+      maxAgents: null,
+      budgetPerAgent: null,
+      requiredSkills: [],
+      minReputation: null,
+    };
+
+    this.telegramNotifier.send(
+      `🧪 Telegram /prompt received${requestedBy ? ` from @${requestedBy}` : ""}\nID: ${syntheticJobId}\nPrompt:\n${prompt}`
+    );
+
+    this.emitEvent({ type: "job_found", job: syntheticJob });
+    this.emitEvent({ type: "job_processing", job: syntheticJob });
+
+    try {
+      const llm = getLLMClient();
+      const result = await llm.generate({
+        prompt,
+        systemPrompt: buildHackathonSystemPrompt({ budget: syntheticBudget }),
+        tools: true,
+      });
+
+      let usage: TokenUsage | undefined;
+      if (result.usage) {
+        const cost = estimateCost(
+          config.model,
+          result.usage.promptTokens,
+          result.usage.completionTokens
+        );
+        usage = {
+          promptTokens: result.usage.promptTokens,
+          completionTokens: result.usage.completionTokens,
+          totalTokens: result.usage.totalTokens,
+          estimatedCost: cost,
+        };
+      }
+
+      this.emitEvent({
+        type: "response_generated",
+        job: syntheticJob,
+        preview: result.text,
+        usage,
+      });
+
+      if (result.projectBuild?.success) {
+        this.emitEvent({
+          type: "project_built",
+          job: syntheticJob,
+          files: result.projectBuild.files,
+          zipPath: result.projectBuild.zipPath,
+        });
+
+        this.telegramNotifier.send(
+          `📁 /prompt project built\nID: ${syntheticJobId}\nZip: ${result.projectBuild.zipPath}` +
+            `${result.projectBuild.workspaceProjectDir ? `\nWorkspace folder: ${result.projectBuild.workspaceProjectDir}` : ""}`
+        );
+      }
+
+      this.telegramNotifier.send(
+        `✅ /prompt complete\nID: ${syntheticJobId}` +
+          `${usage ? `\nTokens: ${usage.totalTokens} (cost ~$${usage.estimatedCost.toFixed(4)})` : ""}` +
+          `\n\n${result.text}`
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.emitEvent({
+        type: "error",
+        message: `Error processing telegram /prompt ${syntheticJobId}: ${message}`,
+        error: error instanceof Error ? error : new Error(message),
+      });
+
+      this.telegramNotifier.send(`❌ /prompt failed\nID: ${syntheticJobId}\nError: ${message}`);
+    } finally {
+      this.processingTelegramPrompt = false;
     }
   }
 
@@ -332,6 +532,10 @@ export class AgentRunner extends EventEmitter implements TypedEventEmitter {
     // Connect WebSocket for real-time job notifications
     this.connectWebSocket();
 
+    // Initialize and start Telegram command polling for /prompt
+    await this.bootstrapTelegramCommandOffset();
+    this.startTelegramCommandPolling();
+
     // Start polling loop (always runs as fallback, slower when WS is active)
     await this.poll();
   }
@@ -345,6 +549,7 @@ export class AgentRunner extends EventEmitter implements TypedEventEmitter {
       clearTimeout(this.pollTimer);
       this.pollTimer = null;
     }
+    this.stopTelegramCommandPolling();
     this.disconnectWebSocket();
     this.emitEvent({ type: "shutdown" });
   }

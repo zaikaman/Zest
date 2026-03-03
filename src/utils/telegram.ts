@@ -2,6 +2,26 @@ import fetch from "node-fetch";
 
 const TELEGRAM_MAX_MESSAGE_LENGTH = 4000;
 
+export interface TelegramUpdate {
+  update_id: number;
+  message?: {
+    message_id: number;
+    text?: string;
+    date: number;
+    chat: {
+      id: number;
+      type: string;
+    };
+    from?: {
+      id: number;
+      is_bot: boolean;
+      username?: string;
+      first_name?: string;
+      last_name?: string;
+    };
+  };
+}
+
 export class TelegramNotifier {
   private readonly enabled: boolean;
   private readonly token: string;
@@ -16,6 +36,10 @@ export class TelegramNotifier {
 
   isEnabled(): boolean {
     return this.enabled;
+  }
+
+  getChatId(): string {
+    return this.chatId;
   }
 
   send(text: string): void {
@@ -74,6 +98,42 @@ export class TelegramNotifier {
       const body = await response.text();
       throw new Error(`Telegram send failed with HTTP ${response.status}: ${body}`);
     }
+  }
+
+  async getUpdates(offset?: number, timeoutSec = 0): Promise<TelegramUpdate[]> {
+    if (!this.enabled) {
+      return [];
+    }
+
+    const endpoint = `https://api.telegram.org/bot${this.token}/getUpdates`;
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        offset,
+        timeout: timeoutSec,
+        allowed_updates: ["message"],
+      }),
+    });
+
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`Telegram getUpdates failed with HTTP ${response.status}: ${body}`);
+    }
+
+    const payload = (await response.json()) as {
+      ok?: boolean;
+      result?: TelegramUpdate[];
+      description?: string;
+    };
+
+    if (!payload.ok) {
+      throw new Error(`Telegram getUpdates failed: ${payload.description || "Unknown error"}`);
+    }
+
+    return Array.isArray(payload.result) ? payload.result : [];
   }
 }
 

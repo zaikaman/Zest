@@ -54,6 +54,7 @@ export interface LLMResponse {
 }
 
 let activeProjectBuilder: ProjectBuilder | null = null;
+let providerToolCallingUnavailable = false;
 
 function getActiveBuilder(): ProjectBuilder | null {
   return activeProjectBuilder;
@@ -169,11 +170,7 @@ interface GeminiResponse {
 interface GeminiFunctionDeclaration {
   name: string;
   description: string;
-  parameters: {
-    type: "OBJECT";
-    properties: Record<string, unknown>;
-    required?: string[];
-  };
+  parameters: Record<string, unknown>;
 }
 
 interface ToolDefinition<TArgs extends Record<string, unknown> = Record<string, unknown>, TResult = unknown> {
@@ -181,6 +178,392 @@ interface ToolDefinition<TArgs extends Record<string, unknown> = Record<string, 
   schema: ZodTypeAny;
   declaration: GeminiFunctionDeclaration;
   execute: (args: TArgs) => Promise<TResult>;
+}
+
+interface OpenAIChatToolCall {
+  function?: {
+    name?: string;
+    arguments?: unknown;
+  };
+}
+
+interface OpenAIChatCompletionChoice {
+  finish_reason?: string;
+  tool_calls?: OpenAIChatToolCall[];
+  message?: {
+    content?: unknown;
+    tool_calls?: OpenAIChatToolCall[];
+    function_call?: {
+      name?: string;
+      arguments?: unknown;
+    };
+  };
+}
+
+interface OpenAIChatCompletionResponse {
+  choices?: OpenAIChatCompletionChoice[];
+  tool_calls?: OpenAIChatToolCall[];
+  output?: Array<{
+    type?: string;
+    name?: string;
+    arguments?: unknown;
+  }>;
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+  };
+}
+
+interface OpenAIResponsesApiResponse {
+  output_text?: string;
+  output?: Array<{
+    type?: string;
+    name?: string;
+    arguments?: unknown;
+    content?: Array<{
+      type?: string;
+      text?: string;
+    }>;
+  }>;
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    total_tokens?: number;
+  };
+}
+
+function parseToolArguments(rawArgs: unknown): Record<string, unknown> {
+  if (isPlainObject(rawArgs)) {
+    return rawArgs;
+  }
+
+  if (typeof rawArgs === "string" && rawArgs.trim().length > 0) {
+    try {
+      const parsed = JSON.parse(rawArgs);
+      if (isPlainObject(parsed)) {
+        return parsed;
+      }
+    } catch {
+      return {};
+    }
+  }
+
+  return {};
+}
+
+function extractTextFromMessageContent(content: unknown): string {
+  if (typeof content === "string") {
+    return content;
+  }
+
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (!isPlainObject(part)) return "";
+        if (typeof part.text === "string") return part.text;
+        if (isPlainObject(part.text) && typeof part.text.value === "string") {
+          return part.text.value;
+        }
+        return "";
+      })
+      .filter((text) => text.length > 0)
+      .join("\n");
+  }
+
+  return "";
+}
+
+function extractToolCallsFromChoice(choice?: OpenAIChatCompletionChoice): GeminiFunctionCall[] {
+  if (!choice) return [];
+
+  const fromMessage = Array.isArray(choice.message?.tool_calls) ? choice.message.tool_calls : [];
+  const fromChoice = Array.isArray(choice.tool_calls) ? choice.tool_calls : [];
+
+  const messageRecord = isPlainObject(choice.message) ? (choice.message as Record<string, unknown>) : undefined;
+  const camelCaseCalls = Array.isArray(messageRecord?.toolCalls)
+    ? (messageRecord.toolCalls as OpenAIChatToolCall[])
+    : [];
+
+  const combined = [...fromMessage, ...fromChoice, ...camelCaseCalls];
+  const toolCalls: GeminiFunctionCall[] = [];
+
+  for (const toolCall of combined) {
+    const name = toolCall.function?.name;
+    if (!name) continue;
+
+    toolCalls.push({
+      name,
+      args: parseToolArguments(toolCall.function?.arguments),
+    });
+  }
+
+  const legacyName = choice.message?.function_call?.name;
+  if (legacyName) {
+    toolCalls.push({
+      name: legacyName,
+      args: parseToolArguments(choice.message?.function_call?.arguments),
+    });
+  }
+
+  return toolCalls;
+}
+
+function extractToolCallsFromResponse(data: OpenAIChatCompletionResponse): GeminiFunctionCall[] {
+  const firstChoice = data.choices?.[0];
+  const fromChoice = extractToolCallsFromChoice(firstChoice);
+  if (fromChoice.length > 0) {
+    return fromChoice;
+  }
+
+  const topLevelCalls = Array.isArray(data.tool_calls) ? data.tool_calls : [];
+  const topLevelParsed = topLevelCalls
+    .map((toolCall): GeminiFunctionCall | null => {
+      const name = toolCall.function?.name;
+      if (!name) return null;
+      return {
+        name,
+        args: parseToolArguments(toolCall.function?.arguments),
+      };
+    })
+    .filter((call): call is GeminiFunctionCall => call !== null);
+
+  if (topLevelParsed.length > 0) {
+    return topLevelParsed;
+  }
+
+  const outputItems = Array.isArray(data.output) ? data.output : [];
+  const outputParsed = outputItems
+    .map((item): GeminiFunctionCall | null => {
+      const isFunctionCall = item.type === "function_call" || item.type === "tool_call";
+      if (!isFunctionCall || typeof item.name !== "string" || item.name.length === 0) {
+        return null;
+      }
+
+      return {
+        name: item.name,
+        args: parseToolArguments(item.arguments),
+      };
+    })
+    .filter((call): call is GeminiFunctionCall => call !== null);
+
+  return outputParsed;
+}
+
+function convertResponsesApiToGeminiResponse(data: OpenAIResponsesApiResponse): GeminiResponse {
+  const parts: GeminiPart[] = [];
+
+  const outputText = typeof data.output_text === "string" ? data.output_text.trim() : "";
+  if (outputText.length > 0) {
+    parts.push({ text: outputText });
+  }
+
+  const outputItems = Array.isArray(data.output) ? data.output : [];
+  for (const item of outputItems) {
+    const isFunctionCall = item.type === "function_call" || item.type === "tool_call";
+    if (isFunctionCall && typeof item.name === "string" && item.name.length > 0) {
+      parts.push({
+        functionCall: {
+          name: item.name,
+          args: parseToolArguments(item.arguments),
+        },
+      });
+      continue;
+    }
+
+    if (item.type === "message" && Array.isArray(item.content)) {
+      const messageText = item.content
+        .map((chunk) => (typeof chunk.text === "string" ? chunk.text : ""))
+        .filter((chunkText) => chunkText.length > 0)
+        .join("\n")
+        .trim();
+
+      if (messageText.length > 0) {
+        parts.push({ text: messageText });
+      }
+    }
+  }
+
+  return {
+    candidates: [
+      {
+        content: {
+          parts,
+        },
+      },
+    ],
+    usageMetadata: {
+      promptTokenCount: data.usage?.input_tokens,
+      candidatesTokenCount: data.usage?.output_tokens,
+      totalTokenCount: data.usage?.total_tokens,
+    },
+  };
+}
+
+function extractJsonObject(text: string): Record<string, unknown> | null {
+  const trimmed = text.trim();
+  const candidates: string[] = [];
+
+  candidates.push(trimmed);
+
+  const fencedMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fencedMatch?.[1]) {
+    candidates.push(fencedMatch[1].trim());
+  }
+
+  const firstBrace = trimmed.indexOf("{");
+  const lastBrace = trimmed.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    candidates.push(trimmed.slice(firstBrace, lastBrace + 1));
+  }
+
+  const balancedCandidates: string[] = [];
+  for (let i = 0; i < trimmed.length; i++) {
+    if (trimmed[i] !== "{") continue;
+
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+
+    for (let j = i; j < trimmed.length; j++) {
+      const char = trimmed[j];
+
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+
+      if (char === "\\") {
+        escaped = true;
+        continue;
+      }
+
+      if (char === '"') {
+        inString = !inString;
+        continue;
+      }
+
+      if (inString) {
+        continue;
+      }
+
+      if (char === "{") {
+        depth++;
+      } else if (char === "}") {
+        depth--;
+        if (depth === 0) {
+          balancedCandidates.push(trimmed.slice(i, j + 1));
+          break;
+        }
+      }
+    }
+  }
+
+  candidates.push(...balancedCandidates);
+
+  const parsedObjects: Record<string, unknown>[] = [];
+
+  for (let index = candidates.length - 1; index >= 0; index--) {
+    const candidate = candidates[index];
+    if (!candidate) continue;
+    try {
+      const parsed = JSON.parse(candidate);
+      if (isPlainObject(parsed)) {
+        parsedObjects.push(parsed);
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  const protocolObject = parsedObjects.find((parsed) => {
+    const typeValue = typeof parsed.type === "string" ? parsed.type : "";
+    if (typeValue === "tool_calls" || typeValue === "final") {
+      return true;
+    }
+
+    if (Array.isArray(parsed.calls)) {
+      return true;
+    }
+
+    return false;
+  });
+
+  if (protocolObject) {
+    return protocolObject;
+  }
+
+  for (const parsed of parsedObjects) {
+    return parsed;
+  }
+
+  return null;
+}
+
+function normalizeSchemaType(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizeSchemaType(item));
+  }
+
+  if (!isPlainObject(value)) {
+    return value;
+  }
+
+  const out: Record<string, unknown> = {};
+  for (const [key, raw] of Object.entries(value)) {
+    if (key === "type" && typeof raw === "string") {
+      out[key] = raw.toLowerCase();
+    } else {
+      out[key] = normalizeSchemaType(raw);
+    }
+  }
+
+  return out;
+}
+
+function convertGeminiContentsToOpenAIMessages(
+  contents: Array<{
+    role: "user" | "model";
+    parts: Array<
+      | { text: string }
+      | { functionCall: { name: string; args: Record<string, unknown> } }
+      | { functionResponse: { name: string; response: Record<string, unknown> } }
+    >;
+  }> = [],
+  systemPrompt?: string,
+): Array<Record<string, unknown>> {
+  const messages: Array<Record<string, unknown>> = [];
+
+  if (systemPrompt && systemPrompt.length > 0) {
+    messages.push({ role: "system", content: systemPrompt });
+  }
+
+  for (const entry of contents) {
+    const role = entry.role === "model" ? "assistant" : "user";
+
+    const text = entry.parts
+      .map((part) => ("text" in part ? part.text : ""))
+      .filter((value) => value.length > 0)
+      .join("\n");
+
+    if (text.length > 0) {
+      messages.push({ role, content: text });
+    }
+
+    const functionResponses = entry.parts
+      .map((part) => ("functionResponse" in part ? part.functionResponse : null))
+      .filter((part): part is { name: string; response: Record<string, unknown> } => !!part);
+
+    if (functionResponses.length > 0) {
+      const block = functionResponses
+        .map((responsePart) => `Tool ${responsePart.name} result:\n${JSON.stringify(responsePart.response)}`)
+        .join("\n\n");
+
+      messages.push({ role: "user", content: block });
+    }
+  }
+
+  return messages;
 }
 
 interface GenerationResumeState {
@@ -555,6 +938,52 @@ function rebuildToolLoopContents(params: {
   return rebuilt;
 }
 
+function getLatestFinalizeCall(
+  toolCalls: NonNullable<LLMResponse["toolCalls"]>
+): (typeof toolCalls)[number] | undefined {
+  for (let index = toolCalls.length - 1; index >= 0; index--) {
+    if (toolCalls[index].name === "finalize_project") {
+      return toolCalls[index];
+    }
+  }
+
+  return undefined;
+}
+
+function generateDefaultProjectName(prompt: string): string {
+  const stopWords = new Set([
+    "build",
+    "create",
+    "make",
+    "generate",
+    "a",
+    "an",
+    "the",
+    "for",
+    "to",
+    "of",
+    "and",
+    "with",
+    "in",
+    "on",
+    "app",
+    "project",
+  ]);
+
+  const tokens = prompt
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, " ")
+    .split(/\s+/)
+    .filter((token) => token.length >= 3 && !stopWords.has(token));
+
+  const topic = tokens.slice(0, 3).join("-") || "generated-app";
+  const styleWords = ["studio", "forge", "lab", "works", "atelier", "factory"];
+  const style = styleWords[Math.floor(Math.random() * styleWords.length)];
+  const suffix = Math.random().toString(36).slice(2, 6);
+
+  return `${topic}-${style}-${suffix}`.slice(0, 60);
+}
+
 export class LLMClient {
   private apiKey: string;
   private apiBaseUrl: string;
@@ -574,6 +1003,315 @@ export class LLMClient {
     this.model = config.model;
     this.maxTokens = config.maxTokens;
     this.temperature = config.temperature;
+  }
+
+  private async executeGenerationWithTextToolProtocol(params: {
+    prompt: string;
+    systemPrompt?: string;
+    maxTokens: number;
+    temperature: number;
+    tools: Record<string, ToolDefinition>;
+  }): Promise<LLMResponse> {
+    const { prompt, systemPrompt, maxTokens, temperature, tools } = params;
+    const retryConfig = getRetryConfig();
+    const maxSteps = Math.max(1, retryConfig.maxToolSteps);
+    const allToolCalls: NonNullable<LLMResponse["toolCalls"]> = [];
+    let usage: LLMResponse["usage"];
+    let finalText = "";
+    let previousCycleSignature = "";
+    let repeatedCycleCount = 0;
+    const defaultProjectName = generateDefaultProjectName(prompt);
+    const likelyProjectRequest = /\b(build|create|develop|generate|app|website|site|game|dashboard|project|landing page|web app)\b/i.test(
+      prompt
+    );
+
+    const toolCatalog = Object.entries(tools).map(([name, toolDef]) => ({
+      name,
+      description: toolDef.description,
+      parameters: normalizeSchemaType(toolDef.declaration.parameters),
+    }));
+
+    const compactToolCatalog = toolCatalog.map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+    }));
+
+    let runningContext = `Original user request:\n${prompt}`;
+
+    const protocolInstruction = [
+      systemPrompt || "",
+      "You are operating in TOOL_PROTOCOL_JSON mode because native tool calls are unavailable.",
+      "Respond with ONLY one JSON object and no extra prose.",
+      "Allowed JSON responses:",
+      '{"type":"tool_calls","calls":[{"name":"tool_name","args":{}}]}',
+      '{"type":"final","text":"final answer"}',
+      "Use tool_calls whenever work is required before finalizing.",
+      `Available tools (names + purpose): ${JSON.stringify(compactToolCatalog)}`,
+      "Only include arguments needed by the selected tool.",
+    ]
+      .filter((line) => line.length > 0)
+      .join("\n\n");
+
+    for (let step = 0; step < maxSteps; step++) {
+      let stepResult = await this.executeGeneration({
+        prompt: `${runningContext}\n\nReturn ONLY valid JSON now.`,
+        systemPrompt: protocolInstruction,
+        maxTokens,
+        temperature,
+        tools: undefined,
+      });
+
+      if (stepResult.text.trim().length === 0) {
+        logger.warn(`Text-json step ${step + 1} returned empty text; retrying once with compact rescue prompt`);
+        stepResult = await this.executeGeneration({
+          prompt:
+            `${runningContext}\n\nReturn exactly one JSON object only. ` +
+            `Use either {"type":"tool_calls","calls":[{"name":"...","args":{}}]} or {"type":"final","text":"..."}.`,
+          maxTokens,
+          temperature,
+          tools: undefined,
+        });
+      }
+
+      usage = stepResult.usage || usage;
+      finalText = stepResult.text || finalText;
+
+      let parsed = extractJsonObject(stepResult.text);
+      if (!parsed) {
+        logger.warn(`Text-json step ${step + 1} returned non-JSON content; forcing strict JSON correction turn`);
+        const correction = await this.executeGeneration({
+          prompt:
+            `${runningContext}\n\nYour last response was invalid for TOOL_PROTOCOL_JSON mode. ` +
+            `Respond now with exactly one JSON object only: ` +
+            `{"type":"tool_calls","calls":[{"name":"...","args":{}}]} or {"type":"final","text":"..."}.`,
+          maxTokens,
+          temperature,
+          tools: undefined,
+        });
+        usage = correction.usage || usage;
+        if (correction.text.trim().length > 0) {
+          finalText = correction.text;
+        }
+        parsed = extractJsonObject(correction.text);
+      }
+
+      if (!parsed) {
+        break;
+      }
+
+      const responseType = typeof parsed.type === "string" ? parsed.type : "";
+      if (responseType === "final") {
+        if (likelyProjectRequest && allToolCalls.length === 0) {
+          logger.warn("Ignoring premature final response in project request; requiring at least one tool call first");
+          runningContext =
+            `${runningContext}\n\nDo not finalize yet. First call tools to create and validate files, then finalize_project.`;
+          continue;
+        }
+
+        finalText = typeof parsed.text === "string" ? parsed.text : finalText;
+        break;
+      }
+
+      if (responseType !== "tool_calls") {
+        break;
+      }
+
+      const calls = Array.isArray(parsed.calls) ? parsed.calls : [];
+      if (calls.length === 0) {
+        break;
+      }
+
+      const currentCycleSignature = JSON.stringify(calls);
+      if (currentCycleSignature === previousCycleSignature) {
+        repeatedCycleCount++;
+      } else {
+        repeatedCycleCount = 0;
+        previousCycleSignature = currentCycleSignature;
+      }
+
+      if (repeatedCycleCount >= 3) {
+        logger.warn("Text-json tool protocol detected repeated call cycle; stopping to avoid infinite loop");
+        break;
+      }
+
+      const toolOutputs: Array<{ name: string; result: unknown }> = [];
+      let finalizedProjectThisStep = false;
+
+      for (const call of calls) {
+        if (!isPlainObject(call)) continue;
+        const toolName = typeof call.name === "string" ? call.name : "";
+        const rawArgs = isPlainObject(call.args) ? { ...call.args } : {};
+        if (!toolName) continue;
+
+        const args: Record<string, unknown> = { ...rawArgs };
+        if (toolName === "edit_file") {
+          if (typeof args.path !== "string" && typeof rawArgs.file_path === "string") {
+            args.path = rawArgs.file_path;
+          }
+          if (typeof args.search !== "string" && typeof rawArgs.search_text === "string") {
+            args.search = rawArgs.search_text;
+          }
+          if (typeof args.replace !== "string" && typeof rawArgs.replace_text === "string") {
+            args.replace = rawArgs.replace_text;
+          }
+        }
+        if (toolName === "finalize_project" && typeof args.projectName !== "string") {
+          args.projectName = defaultProjectName;
+        }
+
+        const toolDef = tools[toolName];
+        let toolResult: unknown;
+
+        if (!toolDef) {
+          toolResult = { error: `Unknown tool: ${toolName}` };
+        } else {
+          const validated = toolDef.schema.safeParse(args);
+          if (!validated.success) {
+            toolResult = {
+              error: "Invalid arguments",
+              details: validated.error.issues.map((issue) => ({
+                path: issue.path.join("."),
+                message: issue.message,
+              })),
+            };
+          } else {
+            toolResult = await toolDef.execute(validated.data as Record<string, unknown>);
+          }
+        }
+
+        allToolCalls.push({
+          name: toolName,
+          args,
+          result: toolResult,
+        });
+
+        toolOutputs.push({
+          name: toolName,
+          result: compactToolResultForModel(toolName, toolResult),
+        });
+
+        if (
+          toolName === "finalize_project" &&
+          isPlainObject(toolResult) &&
+          toolResult.success === true
+        ) {
+          finalizedProjectThisStep = true;
+        }
+
+        if (allToolCalls.length >= retryConfig.maxToolCalls) {
+          break;
+        }
+      }
+
+      if (allToolCalls.length >= retryConfig.maxToolCalls) {
+        break;
+      }
+
+      if (finalizedProjectThisStep) {
+        logger.info("Text-json tool protocol finalized project successfully; stopping loop");
+        break;
+      }
+
+      runningContext = `${runningContext}\n\nTool outputs from step ${step + 1}:\n${JSON.stringify(toolOutputs)}`;
+    }
+
+    const hasSuccessfulFinalize = allToolCalls.some(
+      (toolCall) =>
+        toolCall.name === "finalize_project" &&
+        isPlainObject(toolCall.result) &&
+        toolCall.result.success === true
+    );
+
+    const builderAfterLoop = getActiveBuilder();
+    const hasGeneratedFiles = !!builderAfterLoop && builderAfterLoop.getFiles().length > 0;
+
+    if (hasGeneratedFiles && !hasSuccessfulFinalize) {
+      logger.warn("Generated files detected without finalize_project; auto-finalizing to persist workspace project folder");
+
+      const validateDef = tools.validate_project_build;
+      if (validateDef) {
+        let validateResult: unknown;
+        try {
+          validateResult = await validateDef.execute({});
+        } catch (error) {
+          validateResult = { error: getErrorMessage(error) };
+        }
+        allToolCalls.push({
+          name: "validate_project_build",
+          args: {},
+          result: validateResult,
+        });
+      }
+
+      const finalizeDef = tools.finalize_project;
+      if (finalizeDef) {
+        let finalizeResult: unknown;
+        const finalizeArgs: Record<string, unknown> = { projectName: defaultProjectName };
+        try {
+          finalizeResult = await finalizeDef.execute(finalizeArgs);
+        } catch (error) {
+          finalizeResult = { error: getErrorMessage(error) };
+        }
+        allToolCalls.push({
+          name: "finalize_project",
+          args: finalizeArgs,
+          result: finalizeResult,
+        });
+      }
+    }
+
+    if (!finalText) {
+      if (allToolCalls.length > 0) {
+        const finalizeText = await this.executeGeneration({
+          prompt:
+            `${prompt}\n\nTools executed: ${JSON.stringify(allToolCalls.slice(-12))}\n\n` +
+            "Provide a concise final answer for the user summarizing what was produced.",
+          maxTokens,
+          temperature,
+          tools: undefined,
+        });
+        finalText = finalizeText.text.trim() || "Task complete.";
+      } else {
+        const plainFallback = await this.executeGeneration({
+          prompt: `${prompt}\n\nProvide a complete direct response in plain text.`,
+          maxTokens,
+          temperature,
+          tools: undefined,
+        });
+        finalText = plainFallback.text.trim() || "Task complete.";
+      }
+    }
+
+    let projectBuild: ProjectBuildResult | undefined;
+    const finalizeCall = getLatestFinalizeCall(allToolCalls);
+    if (finalizeCall && finalizeCall.result) {
+      const finalizeResult = finalizeCall.result as {
+        success: boolean;
+        zipPath: string;
+        workspaceProjectDir?: string;
+        files: string[];
+        totalSize: number;
+      };
+
+      const builder = getActiveBuilder();
+      if (finalizeResult.success && builder) {
+        projectBuild = {
+          success: true,
+          projectDir: builder.getProjectDir(),
+          zipPath: finalizeResult.zipPath,
+          workspaceProjectDir: finalizeResult.workspaceProjectDir,
+          files: finalizeResult.files,
+          totalSize: finalizeResult.totalSize,
+        };
+      }
+    }
+
+    return {
+      text: finalText,
+      toolCalls: allToolCalls.length > 0 ? allToolCalls : undefined,
+      usage,
+      projectBuild,
+    };
   }
 
   private getTools(): Record<string, ToolDefinition> {
@@ -1093,25 +1831,90 @@ export class LLMClient {
 
     activeProjectBuilder = null;
 
-    const tools = enableTools ? this.getTools() : undefined;
-    const hasTools = !!tools && Object.keys(tools).length > 0;
+    const config = getConfig();
+    const availableTools = enableTools ? this.getTools() : undefined;
+    const hasTools = !!availableTools && Object.keys(availableTools).length > 0;
+    const useTextJsonToolProtocol = config.llmToolCallingMode === "text-json";
+
+    if (enableTools && hasTools && availableTools && useTextJsonToolProtocol) {
+      logger.info("Using text-json tool protocol as primary tool-calling mode");
+      return await this.executeGenerationWithTextToolProtocol({
+        prompt,
+        systemPrompt,
+        maxTokens,
+        temperature,
+        tools: availableTools,
+      });
+    }
+
+    if (enableTools && providerToolCallingUnavailable && hasTools && availableTools) {
+      logger.warn("Provider lacks native tool-calling; using JSON text tool protocol fallback");
+      return await this.executeGenerationWithTextToolProtocol({
+        prompt,
+        systemPrompt,
+        maxTokens,
+        temperature,
+        tools: availableTools,
+      });
+    }
+
+    if (enableTools && providerToolCallingUnavailable) {
+      logger.warn("Skipping tool-calling: provider/model marked as tool-call incompatible in this process");
+    }
 
     let lastError: unknown;
     let attempt = 0;
     const retryConfig = getRetryConfig();
     const generationStartedAt = Date.now();
     let resumeState: GenerationResumeState | undefined;
+    let attemptedEmptyFallback = false;
 
     while (attempt <= retryConfig.maxRetries) {
       try {
-        return await this.executeGeneration({
+        const generationResult = await this.executeGeneration({
           prompt,
           systemPrompt,
           maxTokens,
           temperature,
-          tools: hasTools ? tools : undefined,
+          tools: hasTools ? availableTools : undefined,
           resumeState,
         });
+
+        const hasNoToolCalls = !generationResult.toolCalls || generationResult.toolCalls.length === 0;
+        if (
+          hasTools &&
+          retryConfig.fallbackNoTools &&
+          !attemptedEmptyFallback &&
+          hasNoToolCalls &&
+          generationResult.text.trim().length === 0
+        ) {
+          attemptedEmptyFallback = true;
+          providerToolCallingUnavailable = true;
+          logger.warn(
+            "Tool-enabled generation returned empty text and no tool calls; switching to JSON text tool protocol fallback"
+          );
+
+          activeProjectBuilder = null;
+          if (availableTools) {
+            return await this.executeGenerationWithTextToolProtocol({
+              prompt,
+              systemPrompt,
+              maxTokens,
+              temperature,
+              tools: availableTools,
+            });
+          }
+
+          return await this.executeGeneration({
+            prompt: `${prompt}\n\n[Return a complete text response only. Tool calls are unavailable for this provider/model.]`,
+            systemPrompt,
+            maxTokens,
+            temperature,
+            tools: undefined,
+          });
+        }
+
+        return generationResult;
       } catch (error) {
         lastError = error;
 
@@ -1193,24 +1996,65 @@ export class LLMClient {
 
   private async invokeGemini(payload: Record<string, unknown>): Promise<GeminiResponse> {
     const base = this.apiBaseUrl.replace(/\/$/, "");
-    const endpoint = `${base}/models/${this.model}:generateContent?key=${encodeURIComponent(this.apiKey)}`;
+    const endpoint = `${base}/chat/completions`;
 
     await waitForGlobalGeminiCooldown();
 
+    const sourceContents = Array.isArray(payload.contents)
+      ? (payload.contents as Parameters<typeof convertGeminiContentsToOpenAIMessages>[0])
+      : [];
+
+    const systemPrompt = isPlainObject(payload.systemInstruction)
+      ? (() => {
+          const parts = (payload.systemInstruction as { parts?: Array<{ text?: string }> }).parts;
+          return Array.isArray(parts) && typeof parts[0]?.text === "string" ? parts[0].text : undefined;
+        })()
+      : undefined;
+
+    const generationConfig = isPlainObject(payload.generationConfig)
+      ? (payload.generationConfig as { temperature?: number; maxOutputTokens?: number })
+      : {};
+
+    const toolDeclarations = Array.isArray(payload.tools)
+      ? (payload.tools as Array<{ functionDeclarations?: GeminiFunctionDeclaration[] }>)
+      : [];
+
+    const openAIPayload: Record<string, unknown> = {
+      model: this.model,
+      messages: convertGeminiContentsToOpenAIMessages(sourceContents, systemPrompt),
+      temperature: typeof generationConfig.temperature === "number" ? generationConfig.temperature : this.temperature,
+      max_tokens:
+        typeof generationConfig.maxOutputTokens === "number" ? generationConfig.maxOutputTokens : this.maxTokens,
+    };
+
+    const firstToolBlock = toolDeclarations[0];
+    if (firstToolBlock?.functionDeclarations?.length) {
+      openAIPayload.tools = firstToolBlock.functionDeclarations.map((declaration) => ({
+        type: "function",
+        function: {
+          name: declaration.name,
+          description: declaration.description,
+          parameters: normalizeSchemaType(declaration.parameters),
+        },
+      }));
+      openAIPayload.tool_choice = "auto";
+    }
+
     logger.debug(
-      `Gemini request -> model=${this.model}, endpoint=${base}/models/{model}:generateContent, payloadBytes=${JSON.stringify(payload).length}`
+      `LLM request -> model=${this.model}, endpoint=${base}/chat/completions, payloadBytes=${JSON.stringify(openAIPayload).length}`
     );
 
     const response = await fetch(endpoint, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
+        Authorization: `Bearer ${this.apiKey}`,
       },
-      body: JSON.stringify(payload),
+      body: JSON.stringify(openAIPayload),
     });
 
     const text = await response.text();
-    logger.debug(`Gemini response <- status=${response.status}, bodyPreview=${text.substring(0, 220)}`);
+    logger.debug(`LLM response <- status=${response.status}, bodyPreview=${text.substring(0, 220)}`);
 
     if (!response.ok) {
       const retryAfterHeader = response.headers.get("retry-after");
@@ -1228,20 +2072,113 @@ export class LLMClient {
       }
 
       throw new GeminiApiError(
-        `Gemini API request failed (${response.status}): ${text.substring(0, 300)}`,
+        `OpenAI-compatible API request failed (${response.status}): ${text.substring(0, 300)}`,
         response.status,
         retryAfterMs
       );
     }
 
-    let data: GeminiResponse;
+    let data: OpenAIChatCompletionResponse;
     try {
-      data = JSON.parse(text) as GeminiResponse;
+      data = JSON.parse(text) as OpenAIChatCompletionResponse;
     } catch {
-      throw new Error(`Gemini API returned non-JSON response: ${text.substring(0, 300)}`);
+      throw new Error(`OpenAI-compatible API returned non-JSON response: ${text.substring(0, 300)}`);
     }
 
-    return data;
+    const firstChoice = data.choices?.[0];
+    const assistantMessage = firstChoice?.message;
+    const parts: GeminiPart[] = [];
+
+    const assistantText = extractTextFromMessageContent(assistantMessage?.content);
+    if (assistantText.length > 0) {
+      parts.push({ text: assistantText });
+    }
+
+    const extractedToolCalls = extractToolCallsFromResponse(data);
+    for (const toolCall of extractedToolCalls) {
+      parts.push({
+        functionCall: {
+          name: toolCall.name,
+          args: toolCall.args || {},
+        },
+      });
+    }
+
+    if (firstChoice?.finish_reason === "tool_calls" && extractedToolCalls.length === 0) {
+      logger.warn(
+        `Provider signaled tool_calls but none parsed; raw choice preview=${JSON.stringify(firstChoice || {}).substring(0, 1200)}, raw response preview=${JSON.stringify(data).substring(0, 2200)}`
+      );
+
+      const responsesEndpoint = `${base}/responses`;
+      const chatMessages = Array.isArray(openAIPayload.messages)
+        ? (openAIPayload.messages as Array<{ role?: string; content?: unknown }>)
+        : [];
+
+      const responsesPayload: Record<string, unknown> = {
+        model: this.model,
+        input: chatMessages.filter((message) => message.role !== "system"),
+        max_output_tokens: openAIPayload.max_tokens,
+        temperature: openAIPayload.temperature,
+      };
+
+      if (systemPrompt) {
+        responsesPayload.instructions = systemPrompt;
+      }
+
+      if (Array.isArray(openAIPayload.tools) && openAIPayload.tools.length > 0) {
+        responsesPayload.tools = openAIPayload.tools;
+        responsesPayload.tool_choice = "auto";
+      }
+
+      logger.warn(
+        `Falling back to Responses API for missing tool_calls shape: endpoint=${responsesEndpoint}, payloadBytes=${JSON.stringify(responsesPayload).length}`
+      );
+
+      const responsesResult = await fetch(responsesEndpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.apiKey}`,
+        },
+        body: JSON.stringify(responsesPayload),
+      });
+
+      const responsesText = await responsesResult.text();
+      logger.debug(`Responses API <- status=${responsesResult.status}, bodyPreview=${responsesText.substring(0, 300)}`);
+
+      if (!responsesResult.ok) {
+        throw new GeminiApiError(
+          `Responses API fallback failed (${responsesResult.status}): ${responsesText.substring(0, 300)}`,
+          responsesResult.status,
+        );
+      }
+
+      try {
+        const responsesJson = JSON.parse(responsesText) as OpenAIResponsesApiResponse;
+        const converted = convertResponsesApiToGeminiResponse(responsesJson);
+        const convertedParts = converted.candidates?.[0]?.content?.parts || [];
+        if (convertedParts.length > 0) {
+          return converted;
+        }
+      } catch {
+        logger.warn("Responses API fallback returned non-JSON payload");
+      }
+    }
+
+    return {
+      candidates: [
+        {
+          content: {
+            parts,
+          },
+        },
+      ],
+      usageMetadata: {
+        promptTokenCount: data.usage?.prompt_tokens,
+        candidatesTokenCount: data.usage?.completion_tokens,
+        totalTokenCount: data.usage?.total_tokens,
+      },
+    };
   }
 
   private async executeGeneration(params: {
@@ -1565,7 +2502,7 @@ export class LLMClient {
     }
 
     let projectBuild: ProjectBuildResult | undefined;
-    const finalizeCall = allToolCalls.find((toolCall) => toolCall.name === "finalize_project");
+    const finalizeCall = getLatestFinalizeCall(allToolCalls);
     if (finalizeCall && finalizeCall.result) {
       const finalizeResult = finalizeCall.result as {
         success: boolean;

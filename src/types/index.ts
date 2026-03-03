@@ -208,6 +208,7 @@ export interface AgentConfig {
   llmRetryBaseDelayMs: number;
   llmRetryMaxDelayMs: number;
   llmRetryFallbackNoTools: boolean;
+  llmToolCallingMode: "text-json" | "native";
   llmMaxToolSteps: number;
   llmMaxToolCalls: number;
   llmMaxGenerationMs: number;

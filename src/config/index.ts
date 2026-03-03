@@ -34,11 +34,15 @@ export const configStore = new Conf<StoredConfig>({
  */
 export function getConfig(): AgentConfig {
   const stored = configStore.store;
+  const llmToolCallingMode: AgentConfig["llmToolCallingMode"] =
+    (process.env.LLM_TOOL_CALLING_MODE || "text-json").toLowerCase() === "native"
+      ? "native"
+      : "text-json";
 
   return {
     // API Keys
     geminiApiKey: process.env.GEMINI_API_KEY || "",
-    geminiApiBaseUrl: process.env.GEMINI_API_BASE_URL || "https://v98store.com/v1beta",
+    geminiApiBaseUrl: process.env.GEMINI_API_BASE_URL || "https://ezaiapi.com/v1",
     seedstrApiKey: process.env.SEEDSTR_API_KEY || stored.seedstrApiKey || "",
     tavilyApiKey: process.env.TAVILY_API_KEY || "",
 
@@ -47,8 +51,8 @@ export function getConfig(): AgentConfig {
       process.env.SOLANA_WALLET_ADDRESS || stored.walletAddress || "",
 
     // Model settings
-    model: process.env.GEMINI_MODEL || "gemini-3-pro-preview",
-    maxTokens: parseInt(process.env.MAX_TOKENS || "4096", 10),
+    model: process.env.GEMINI_MODEL || "gemini-3-flash-preview",
+    maxTokens: parseInt(process.env.MAX_TOKENS || "100000", 10),
     temperature: parseFloat(process.env.TEMPERATURE || "0.7"),
 
     // Agent behavior
@@ -85,6 +89,7 @@ export function getConfig(): AgentConfig {
     llmRetryBaseDelayMs: parseInt(process.env.LLM_RETRY_BASE_DELAY_MS || "2000", 10),
     llmRetryMaxDelayMs: parseInt(process.env.LLM_RETRY_MAX_DELAY_MS || "30000", 10),
     llmRetryFallbackNoTools: process.env.LLM_RETRY_FALLBACK_NO_TOOLS !== "false",
+    llmToolCallingMode,
     llmMaxToolSteps: parseInt(process.env.LLM_MAX_TOOL_STEPS || "14", 10),
     llmMaxToolCalls: parseInt(process.env.LLM_MAX_TOOL_CALLS || "120", 10),
     llmMaxGenerationMs: parseInt(process.env.LLM_MAX_GENERATION_MS || "600000", 10),

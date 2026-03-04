@@ -61,6 +61,7 @@ export class AgentRunner extends EventEmitter implements TypedEventEmitter {
   private pusher: PusherClient | null = null;
   private wsConnected = false;
   private telegramNotifier: TelegramNotifier;
+  private telegramLogsEnabled: boolean;
   private telegramCommandTimer: NodeJS.Timeout | null = null;
   private telegramCommandOffset = 0;
   private processingTelegramPrompt = false;
@@ -87,8 +88,9 @@ export class AgentRunner extends EventEmitter implements TypedEventEmitter {
     this.telegramNotifier = new TelegramNotifier(
       config.telegramBotToken,
       config.telegramChatId,
-      config.telegramLogsEnabled
+      config.telegramLogsEnabled || config.telegramPromptCommandEnabled
     );
+    this.telegramLogsEnabled = config.telegramLogsEnabled;
 
     logger.debug(`Loaded ${this.processedJobs.size} previously processed jobs`);
   }
@@ -119,6 +121,10 @@ export class AgentRunner extends EventEmitter implements TypedEventEmitter {
   }
 
   private sendTelegramJobLog(event: AgentEvent): void {
+    if (!this.telegramLogsEnabled) {
+      return;
+    }
+
     if (!this.telegramNotifier.isEnabled()) {
       return;
     }
@@ -175,6 +181,23 @@ export class AgentRunner extends EventEmitter implements TypedEventEmitter {
 
     const prompt = match[1].trim();
     return prompt.length > 0 ? prompt : null;
+  }
+
+  private isPromptCommand(text: string): boolean {
+    return /^\/prompt(?:@\w+)?$/i.test(text.trim());
+  }
+
+  private isAuthorizedTelegramCommandChat(chatId: number, chatType: string): boolean {
+    const configuredChatId = this.telegramNotifier.getChatId();
+    if (String(chatId) === configuredChatId) {
+      return true;
+    }
+
+    if (chatType === "private") {
+      return true;
+    }
+
+    return false;
   }
 
   private async bootstrapTelegramCommandOffset(): Promise<void> {
@@ -250,7 +273,12 @@ export class AgentRunner extends EventEmitter implements TypedEventEmitter {
           continue;
         }
 
-        if (String(message.chat.id) !== this.telegramNotifier.getChatId()) {
+        if (!this.isAuthorizedTelegramCommandChat(message.chat.id, message.chat.type)) {
+          continue;
+        }
+
+        if (this.isPromptCommand(message.text)) {
+          this.telegramNotifier.send("Usage: /prompt <your prompt>\nExample: /prompt build a tic tac toe game");
           continue;
         }
 

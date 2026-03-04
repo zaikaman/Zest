@@ -1074,7 +1074,6 @@ export class LLMClient {
       }
 
       usage = stepResult.usage || usage;
-      finalText = stepResult.text || finalText;
 
       let parsed = extractJsonObject(stepResult.text);
       if (!parsed) {
@@ -1090,6 +1089,8 @@ export class LLMClient {
         });
         usage = correction.usage || usage;
         if (correction.text.trim().length > 0) {
+          // Keep correction text only if we cannot parse a valid protocol object.
+          // Protocol-shaped content is sanitized later and never shown to end users directly.
           finalText = correction.text;
         }
         parsed = extractJsonObject(correction.text);
@@ -1108,7 +1109,9 @@ export class LLMClient {
           continue;
         }
 
-        finalText = typeof parsed.text === "string" ? parsed.text : finalText;
+        if (typeof parsed.text === "string" && parsed.text.trim().length > 0) {
+          finalText = parsed.text;
+        }
         break;
       }
 
@@ -1213,6 +1216,18 @@ export class LLMClient {
       }
 
       runningContext = `${runningContext}\n\nTool outputs from step ${step + 1}:\n${JSON.stringify(toolOutputs)}`;
+    }
+
+    const protocolLikeFinal = extractJsonObject(finalText);
+    if (protocolLikeFinal) {
+      const protocolType = typeof protocolLikeFinal.type === "string" ? protocolLikeFinal.type : "";
+      const hasCalls = Array.isArray(protocolLikeFinal.calls);
+
+      if (protocolType === "final" && typeof protocolLikeFinal.text === "string") {
+        finalText = protocolLikeFinal.text;
+      } else if (protocolType === "tool_calls" || hasCalls) {
+        finalText = "";
+      }
     }
 
     const hasSuccessfulFinalize = allToolCalls.some(

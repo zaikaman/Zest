@@ -1,4 +1,6 @@
 import fetch from "node-fetch";
+import { readFile } from "fs/promises";
+import { basename } from "path";
 
 const TELEGRAM_MAX_MESSAGE_LENGTH = 4000;
 
@@ -45,12 +47,26 @@ export class TelegramNotifier {
   send(text: string): void {
     if (!this.enabled || !text.trim()) return;
 
+    void this.enqueue(() => this.sendAll(text));
+  }
+
+  async sendDocument(filePath: string, caption?: string): Promise<void> {
+    if (!this.enabled || !filePath.trim()) return;
+
+    await this.enqueue(async () => {
+      await this.sendDocumentMessage(filePath, caption);
+    });
+  }
+
+  private enqueue(task: () => Promise<void>): Promise<void> {
     this.queue = this.queue
-      .then(() => this.sendAll(text))
+      .then(task)
       .catch((error: unknown) => {
         const message = error instanceof Error ? error.message : String(error);
         console.error(`[Telegram] ${message}`);
       });
+
+    return this.queue;
   }
 
   private splitMessage(text: string): string[] {
@@ -97,6 +113,29 @@ export class TelegramNotifier {
     if (!response.ok) {
       const body = await response.text();
       throw new Error(`Telegram send failed with HTTP ${response.status}: ${body}`);
+    }
+  }
+
+  private async sendDocumentMessage(filePath: string, caption?: string): Promise<void> {
+    const endpoint = `https://api.telegram.org/bot${this.token}/sendDocument`;
+    const fileBytes = await readFile(filePath);
+
+    const form = new FormData();
+    form.append("chat_id", this.chatId);
+    form.append("document", new Blob([fileBytes]), basename(filePath));
+
+    if (caption && caption.trim().length > 0) {
+      form.append("caption", caption.trim().slice(0, 900));
+    }
+
+    const response = await fetch(endpoint, {
+      method: "POST",
+      body: form,
+    });
+
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`Telegram sendDocument failed with HTTP ${response.status}: ${body}`);
     }
   }
 

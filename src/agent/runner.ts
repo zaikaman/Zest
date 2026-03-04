@@ -366,6 +366,19 @@ export class AgentRunner extends EventEmitter implements TypedEventEmitter {
           zipPath: result.projectBuild.zipPath,
         });
 
+        try {
+          await this.telegramNotifier.sendDocument(
+            result.projectBuild.zipPath,
+            `/${"prompt"} build output (${result.projectBuild.files.length} files)`
+          );
+        } catch (sendFileError) {
+          logger.warn(
+            `Failed to send /prompt zip file to Telegram: ${
+              sendFileError instanceof Error ? sendFileError.message : String(sendFileError)
+            }`
+          );
+        }
+
         this.telegramNotifier.send(
           `📁 /prompt project built\nID: ${syntheticJobId}\nZip: ${result.projectBuild.zipPath}` +
             `${result.projectBuild.workspaceProjectDir ? `\nWorkspace folder: ${result.projectBuild.workspaceProjectDir}` : ""}`

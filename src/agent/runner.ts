@@ -795,6 +795,19 @@ export class AgentRunner extends EventEmitter implements TypedEventEmitter {
         });
 
         try {
+          await this.telegramNotifier.sendDocument(
+            projectBuild.zipPath,
+            `Seedstr job ${job.id} build (${projectBuild.files.length} files)`
+          );
+        } catch (sendFileError) {
+          logger.warn(
+            `Failed to send Seedstr job zip to Telegram: ${
+              sendFileError instanceof Error ? sendFileError.message : String(sendFileError)
+            }`
+          );
+        }
+
+        try {
           // Upload the zip file
           this.emitEvent({
             type: "files_uploading",

@@ -20,11 +20,11 @@ describe("Config", () => {
 
       const config = getConfig();
 
-      expect(config.model).toBe("gemini-3-pro-preview");
-      expect(config.maxTokens).toBe(4096);
+      expect(config.model).toBe("gemini-3-flash-preview");
+      expect(config.maxTokens).toBe(100000);
       expect(config.temperature).toBe(0.7);
       expect(config.minBudget).toBe(0.5);
-      expect(config.pollInterval).toBe(30);
+      expect(config.pollInterval).toBe(180);
       expect(config.maxConcurrentJobs).toBe(3);
       expect(config.logLevel).toBe("info");
     });

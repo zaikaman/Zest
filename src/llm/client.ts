@@ -1178,7 +1178,13 @@ export class LLMClient {
               })),
             };
           } else {
-            toolResult = await toolDef.execute(validated.data as Record<string, unknown>);
+            try {
+              toolResult = await toolDef.execute(validated.data as Record<string, unknown>);
+            } catch (error) {
+              toolResult = {
+                error: getErrorMessage(error),
+              };
+            }
           }
         }
 
